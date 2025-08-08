@@ -3,12 +3,20 @@
 
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
+#include <rocsolver/rocsolver.h>
 #include <vector>
 #include <string>
 
 // Common utilities
 void generate_symmetric_matrix(std::vector<float>& A, int n, unsigned int seed = 42);
 bool test_tridiagonalization(const std::vector<float>& A, int n, rocblas_fill uplo);
+
+// Algorithm types
+enum class AlgorithmType {
+    BLOCKED,
+    UNBLOCKED,
+    ROCSOLVER
+};
 
 // Blocked Householder tridiagonalization
 extern "C" hipError_t hip_block_ssytrd(
@@ -42,7 +50,6 @@ struct BenchmarkResult {
 };
 
 // Benchmark functions
-BenchmarkResult benchmark_blocked_algorithm(int n, int block_size, bool validate, int iterations = 10, int warmup = 3);
-BenchmarkResult benchmark_unblocked_algorithm(int n, bool validate, int iterations = 10, int warmup = 3);
+BenchmarkResult benchmark_algorithm(AlgorithmType algorithm, int n, int block_size, bool validate, int iterations = 10, int warmup = 3);
 
 #endif // HOUSEHOLDER_COMMON_H

@@ -9,22 +9,22 @@
 // Function to print benchmark results table header
 void print_table_header(bool validate, bool comparison_mode) {
     if (comparison_mode) {
-        printf("Matrix Size | Block Size | Blocked Time (ms) | Unblocked Time (ms) | Speedup");
+        printf("Matrix Size | Block Size | Blocked Time (ms) | Unblocked Time (ms) | Speedup | rocSOLVER Time (ms)");
         if (validate) {
-            printf(" | Blocked Valid | Unblocked Valid\n");
-            printf("-------------------------------------------------------------------------------------\n");
+            printf(" | Blocked Valid | Unblocked Valid | rocSOLVER Valid\n");
+            printf("-------------------------------------------------------------------------------------------------------------------------------------------------------\n");
         } else {
             printf("\n");
-            printf("-----------------------------------------------------------------------\n");
+            printf("---------------------------------------------------------------------------------------------------\n");
         }
     } else {
         printf("Matrix Size | Algorithm      | Time (ms)");
         if (validate) {
             printf(" | Validation\n");
-            printf("-----------------------------------------------\n");
+            printf("------------------------------------------------------\n");
         } else {
             printf("\n");
-            printf("------------------------------------\n");
+            printf("-----------------------------------------\n");
         }
     }
 }
@@ -44,20 +44,23 @@ void print_benchmark_result(const BenchmarkResult& result, const std::string& al
 }
 
 // Function to print comparison results
-void print_comparison_result(const BenchmarkResult& blocked_result, const BenchmarkResult& unblocked_result, bool validate) {
+void print_comparison_result(const BenchmarkResult& blocked_result, const BenchmarkResult& unblocked_result, 
+                           const BenchmarkResult& rocsolver_result, bool validate) {
     double speedup = unblocked_result.avg_time_ms / blocked_result.avg_time_ms;
     
-    printf("%11d | %10d | %17.2f | %19.2f | %7.2fx",
+    printf("%11d | %10d | %17.2f | %19.2f | %6.2fx | %19.2f",
            blocked_result.matrix_size,
            blocked_result.block_size,
            blocked_result.avg_time_ms,
            unblocked_result.avg_time_ms,
-           speedup);
+           speedup,
+           rocsolver_result.avg_time_ms);
     
     if (validate) {
-        printf(" | %13s | %15s", 
+        printf(" | %13s | %15s | %15s", 
                blocked_result.validation_result.c_str(),
-               unblocked_result.validation_result.c_str());
+               unblocked_result.validation_result.c_str(),
+               rocsolver_result.validation_result.c_str());
     }
     printf("\n");
 }
@@ -143,19 +146,20 @@ int main(int argc, char* argv[]) {
     // Run benchmarks for each matrix size
     for (int n : matrix_sizes) {
         if (comparison_mode) {
-            // Run both algorithms and compare
-            BenchmarkResult blocked_result = benchmark_blocked_algorithm(n, block_size, validate, iterations, warmup);
-            BenchmarkResult unblocked_result = benchmark_unblocked_algorithm(n, validate, iterations, warmup);
-            print_comparison_result(blocked_result, unblocked_result, validate);
+            // Run all three algorithms and compare
+            BenchmarkResult blocked_result = benchmark_algorithm(AlgorithmType::BLOCKED, n, block_size, validate, iterations, warmup);
+            BenchmarkResult unblocked_result = benchmark_algorithm(AlgorithmType::UNBLOCKED, n, 0, validate, iterations, warmup);
+            BenchmarkResult rocsolver_result = benchmark_algorithm(AlgorithmType::ROCSOLVER, n, 0, validate, iterations, warmup);
+            print_comparison_result(blocked_result, unblocked_result, rocsolver_result, validate);
         } else if (algorithm == "blocked") {
             // Run only blocked algorithm
-            BenchmarkResult result = benchmark_blocked_algorithm(n, block_size, validate, iterations, warmup);
+            BenchmarkResult result = benchmark_algorithm(AlgorithmType::BLOCKED, n, block_size, validate, iterations, warmup);
             std::stringstream ss;
             ss << "Blocked (b=" << block_size << ")";
             print_benchmark_result(result, ss.str(), validate);
         } else if (algorithm == "unblocked") {
             // Run only unblocked algorithm
-            BenchmarkResult result = benchmark_unblocked_algorithm(n, validate, iterations, warmup);
+            BenchmarkResult result = benchmark_algorithm(AlgorithmType::UNBLOCKED, n, 0, validate, iterations, warmup);
             print_benchmark_result(result, "Unblocked", validate);
         }
     }
