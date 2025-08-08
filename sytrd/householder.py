@@ -14,14 +14,20 @@ def block_householder_tridiagonalize(A, p):
         start_col = k * p  # Start column index of the current block
         end_col = min(start_col + p, n - 2)  # End column index of the current block
 
+        # Trailing submatrix size
+        trailing_size = n - start_col
+
         # Initialize U and V matrices for accumulating rank-2p updates
-        U = np.zeros((n, p))
-        V = np.zeros((n, p))
+        U = np.zeros((trailing_size, p))
+        V = np.zeros((trailing_size, p))
 
         # Process each column within the block
         for j in range(start_col, end_col):
             # Extract the column to be updated
             a_col = A[j+1:, j].copy()
+
+            # Block column index
+            j_idx = j - start_col
 
             # Apply previously accumulated updates
             for i in range(start_col, j):
@@ -30,41 +36,38 @@ def block_householder_tridiagonalize(A, p):
                 v_i = V[:, i_idx]
 
                 # Extract relevant components
-                scalar_u = u_i[j]
-                scalar_v = v_i[j]
-                u_tail = u_i[j+1:]
-                v_tail = v_i[j+1:]
+                scalar_u = u_i[j_idx]
+                scalar_v = v_i[j_idx]
+                u_tail = u_i[j_idx+1:]
+                v_tail = v_i[j_idx+1:]
 
                 # Apply the update
                 a_col -= scalar_v * u_tail + scalar_u * v_tail
 
             # Compute the Householder vector
+            u_j = np.zeros(trailing_size)
             norm_a = np.linalg.norm(a_col)
+
             if norm_a < 1e-10:  # Skip zero vector
-                u_j = np.zeros(n)
-                u_j[j+1] = 1.0
+                u_j[j_idx+1] = 1.0
             else:
                 sign = 1.0 if a_col[0] >= 0 else -1.0
                 alpha = -sign * norm_a
 
                 # Construct the Householder vector u_j
-                u_j = np.zeros(n)
-                u_j[j+1] = np.sqrt((1 - a_col[0] / alpha))
+                u_j[j_idx+1] = np.sqrt((1 - a_col[0] / alpha))
 
-                if abs(alpha * u_j[j+1]) > 1e-10:
-                    u_j[j+2:] = -a_col[1:] / (alpha * u_j[j+1])
-
-            # Block column index
-            j_idx = j - start_col
+                if abs(alpha * u_j[j_idx+1]) > 1e-10:
+                    u_j[j_idx+2:] = -a_col[1:] / (alpha * u_j[j_idx+1])
 
             # Compute y_j = (A_orig - UVᵀ - VUᵀ)u_j
             if j_idx > 0:
                 U_prev = U[:, :j_idx]
                 V_prev = V[:, :j_idx]
 
-                y_j = (A - U_prev @ V_prev.T - V_prev @ U_prev.T) @ u_j
+                y_j = (A[start_col:, start_col:] - U_prev @ V_prev.T - V_prev @ U_prev.T) @ u_j
             else:
-                y_j = A @ u_j
+                y_j = A[start_col:, start_col:] @ u_j
 
             # Compute v_j = y_j - (1/2)(y_jᵀu_j)u_j
             v_j = y_j - 0.5 * np.dot(y_j, u_j) * u_j
@@ -78,7 +81,7 @@ def block_householder_tridiagonalize(A, p):
         U_block = U[:, :block_size]
         V_block = V[:, :block_size]
 
-        A -= U_block @ V_block.T + V_block @ U_block.T
+        A[start_col:, start_col:] -= U_block @ V_block.T + V_block @ U_block.T
 
     return A
 

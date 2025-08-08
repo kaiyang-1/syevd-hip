@@ -1,31 +1,5 @@
-#include <hip/hip_runtime.h>
-#include <rocblas/rocblas.h>
-#include <cstdio>
-#include <cstdlib>
-#include <vector>
-#include <random>
-#include <chrono>
-#include <cstring>
-
-// Function to generate a random symmetric matrix on host
-void generate_symmetric_matrix(std::vector<float>& A, int n, unsigned int seed = 42) {
-    std::mt19937 rng(seed);
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    
-    // Initialize matrix to zero
-    std::fill(A.begin(), A.end(), 0.0f);
-    
-    // Generate symmetric matrix in column-major format
-    for (int j = 0; j < n; ++j) {
-        for (int i = j; i < n; ++i) {
-            float value = dist(rng);
-            A[i + j * n] = value;  // Column-major: A[i][j]
-            if (i != j) {
-                A[j + i * n] = value;  // Column-major: A[j][i] = A[i][j]
-            }
-        }
-    }
-}
+#include "householder_common.h"
+#include <cmath>
 
 // Kernel to build Householder vector u given alpha and precomputed u_i1
 template<rocblas_fill uplo>
@@ -51,14 +25,14 @@ __global__ void build_householder_u(int n, int i, const float* A, int lda, float
 }
 
 // Kernel to compute v = y - 0.5 * (y^T u) * u
-__global__ void compute_v(int n, const float* y, const float* u, float dot, float* v) {
+__global__ void compute_v_unblocked(int n, const float* y, const float* u, float dot, float* v) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) v[idx] = y[idx] - 0.5f * dot * u[idx];
 }
 
 // Kernel to extract diagonal D and sub-diagonal E from tridiagonalized A
 template<rocblas_fill uplo>
-__global__ void extract_tridiag(int n, const float* A, int lda, float* D, float* E) {
+__global__ void extract_tridiag_unblocked(int n, const float* A, int lda, float* D, float* E) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         D[i] = A[i + i * lda];
@@ -145,7 +119,7 @@ extern "C" hipError_t hip_ssytrd(
         rocblas_sdot(handle, n, y, 1, u, 1, &dot);
 
         // v = y - 0.5 * dot * u
-        hipLaunchKernelGGL(compute_v, dim3(blocks), dim3(threads), 0, 0,
+        hipLaunchKernelGGL(compute_v_unblocked, dim3(blocks), dim3(threads), 0, 0,
                            n, y, u, dot, v);
         hipDeviceSynchronize();
 
@@ -163,10 +137,10 @@ extern "C" hipError_t hip_ssytrd(
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     if (uplo == rocblas_fill_lower) {
-        hipLaunchKernelGGL(extract_tridiag<rocblas_fill_lower>, dim3(blocks), dim3(threads), 0, 0,
+        hipLaunchKernelGGL(extract_tridiag_unblocked<rocblas_fill_lower>, dim3(blocks), dim3(threads), 0, 0,
                            n, dA, lda, dD, dE);
     } else {
-        hipLaunchKernelGGL(extract_tridiag<rocblas_fill_upper>, dim3(blocks), dim3(threads), 0, 0,
+        hipLaunchKernelGGL(extract_tridiag_unblocked<rocblas_fill_upper>, dim3(blocks), dim3(threads), 0, 0,
                            n, dA, lda, dD, dE);
     }
     hipDeviceSynchronize();
@@ -177,124 +151,4 @@ extern "C" hipError_t hip_ssytrd(
     hipFree(v);
 
     return hipSuccess;
-}
-
-// Tests whether a given matrix has been successfully reduced to tridiagonal form
-bool test_tridiagonalization(const std::vector<float>& A, int n, rocblas_fill uplo) {
-    const float tolerance = 1e-5f;
-
-    // Check all elements outside the tridiagonal band of the matrix are within a specified tolerance
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            if (uplo == rocblas_fill_lower && i > j + 1) {
-                if (std::abs(A[i + j * n]) > tolerance) {
-                    return false;
-                }
-            } else if (uplo == rocblas_fill_upper && j > i + 1) {
-                if (std::abs(A[i + j * n]) > tolerance) {
-                    return false;
-                }
-            }
-        }
-    }
-
-    return true;
-}
-
-int main(int argc, char* argv[]) {
-    std::vector<int> matrix_sizes;
-    bool validate = false;
-
-    // Parse command-line arguments
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "-n") == 0) {
-            while (i + 1 < argc && argv[i + 1][0] != '-') {
-                matrix_sizes.push_back(atoi(argv[++i]));
-            }
-        } else if (strcmp(argv[i], "-v") == 0) {
-            validate = true;
-        }
-    }
-
-    if (matrix_sizes.empty()) {
-        printf("Usage: %s -n size1 size2 ... [-v]\n", argv[0]);
-        return 1;
-    }
-
-    printf("Matrix Size | Average Time (ms)");
-    if (validate) {
-        printf(" | Validation\n");
-        printf("---------------------------------------------\n");
-    } else {
-        printf("\n");
-        printf("--------------------------------\n");
-    }
-
-    for (int n : matrix_sizes) {
-        const int lda = n;
-        const int iterations = 10; // Number of benchmark iterations
-        const int warmup = 3;      // Number of warmup runs (not timed)
-
-        std::vector<float> hA(n * n);
-
-        float *dA, *dD, *dE, *dTau;
-        hipMalloc(&dA, n * lda * sizeof(float));
-        hipMalloc(&dD, n * sizeof(float));
-        hipMalloc(&dE, (n - 1) * sizeof(float));
-        hipMalloc(&dTau, (n - 1) * sizeof(float));
-
-        rocblas_handle handle;
-        rocblas_create_handle(&handle);
-
-        // Generate matrix
-        generate_symmetric_matrix(hA, n);
-
-        // Warmup
-        for (int warmup_iter = 0; warmup_iter < warmup; ++warmup_iter) {
-            hipMemcpy(dA, hA.data(), n * lda * sizeof(float), hipMemcpyHostToDevice);
-            hip_ssytrd(handle, rocblas_fill_lower, n, dA, lda, dD, dE, dTau);
-        }
-
-        // Benchmark
-        double total_time = 0.0;
-        for (int iter = 0; iter < iterations; ++iter) {
-            generate_symmetric_matrix(hA, n);
-            hipMemcpy(dA, hA.data(), n * lda * sizeof(float), hipMemcpyHostToDevice);
-
-            auto start = std::chrono::high_resolution_clock::now();
-            hip_ssytrd(handle, rocblas_fill_lower, n, dA, lda, dD, dE, dTau);
-            auto end = std::chrono::high_resolution_clock::now();
-
-            std::chrono::duration<double, std::micro> elapsed = end - start;
-            total_time += elapsed.count();
-        }
-
-        double avg_time = total_time / iterations / 1000.0; // Convert to milliseconds
-
-        // Validation
-        std::string validation_result = "";
-        if (validate) {
-            hipMemcpy(hA.data(), dA, n * lda * sizeof(float), hipMemcpyDeviceToHost);
-
-            if (test_tridiagonalization(hA, n, rocblas_fill_lower)) {
-                validation_result = "Pass";
-            } else {
-                validation_result = "Fail";
-            }
-        }
-
-        if (validate) {
-            printf("%11d | %17.2f | %10s\n", n, avg_time, validation_result.c_str());
-        } else {
-            printf("%11d | %17.2f\n", n, avg_time);
-        }
-
-        hipFree(dA);
-        hipFree(dD);
-        hipFree(dE);
-        hipFree(dTau);
-        rocblas_destroy_handle(handle);
-    }
-
-    return 0;
 }

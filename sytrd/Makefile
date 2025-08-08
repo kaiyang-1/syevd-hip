@@ -8,41 +8,32 @@ CFLAGS = -O3 -Wall -Wno-unused-result -I${ROCBLAS_DIR}/include --offload-arch=gf
 LDFLAGS = -L${ROCBLAS_DIR}/lib -lrocblas
 
 # Targets
-TARGET_BLOCKED = blocked_householder
-TARGET_UNBLOCKED = unblocked_householder
+TARGET = householder_benchmark
 
 # Source files
-SRC_BLOCKED = blocked_householder.cpp
-SRC_UNBLOCKED = unblocked_householder.cpp
+SRC = main.cpp householder_common.cpp blocked_householder.cpp unblocked_householder.cpp
 
-# Default target
-all: $(TARGET_BLOCKED) $(TARGET_UNBLOCKED)
+# Default target - build the unified benchmark
+all: $(TARGET)
 
-# Build blocked version
-$(TARGET_BLOCKED): $(SRC_BLOCKED)
-	$(CXX) $(CFLAGS) -o $@ $< $(LDFLAGS)
-
-# Build unblocked version
-$(TARGET_UNBLOCKED): $(SRC_UNBLOCKED)
-	$(CXX) $(CFLAGS) -o $@ $< $(LDFLAGS)
+# Build unified benchmark
+$(TARGET): $(SRC)
+	$(CXX) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
 
 # Clean
 clean:
-	rm -f $(TARGET_BLOCKED) $(TARGET_UNBLOCKED)
+	rm -f $(TARGET)
 
-# Run tests
+# Test benchmark with different modes
 test_blocked: $(TARGET_BLOCKED)
-	./$(TARGET_BLOCKED) -n 128 256 512 -b 32 -v
+	./$(TARGET) -a blocked -n 128 256 512 -b 32 -v
 
 test_unblocked: $(TARGET_UNBLOCKED)
-	./$(TARGET_UNBLOCKED) -n 128 256 512 -v
+	./$(TARGET) -a unblocked -n 128 256 512 -v
 
-# Compare performance
-compare: $(TARGET_BLOCKED) $(TARGET_UNBLOCKED)
-	@echo "=== Blocked Householder Performance ==="
-	./$(TARGET_BLOCKED) -n 128 256 512 1024 -b 32
-	@echo ""
-	@echo "=== Unblocked Householder Performance ==="
-	./$(TARGET_UNBLOCKED) -n 128 256 512 1024
+# Run performance comparison
+compare: $(TARGET)
+	@echo "=== Performance Comparison ==="
+	./$(TARGET) -n 128 256 512 1024 -a both -b 32
 
 .PHONY: all clean test_blocked test_unblocked compare
