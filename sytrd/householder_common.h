@@ -2,6 +2,7 @@
 #define HOUSEHOLDER_COMMON_H
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_cooperative_groups.h>
 #include <rocblas/rocblas.h>
 #include <rocsolver/rocsolver.h>
 #include <vector>
