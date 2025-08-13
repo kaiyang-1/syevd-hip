@@ -30,19 +30,11 @@ def block_householder_tridiagonalize(A, p):
             j_idx = j - start_col
 
             # Apply previously accumulated updates
-            for i in range(start_col, j):
-                i_idx = i - start_col
-                u_i = U[:, i_idx]
-                v_i = V[:, i_idx]
+            if j > start_col:
+                U_prev = U[j_idx+1:, :j_idx]
+                V_prev = V[j_idx+1:, :j_idx]
 
-                # Extract relevant components
-                scalar_u = u_i[j_idx]
-                scalar_v = v_i[j_idx]
-                u_tail = u_i[j_idx+1:]
-                v_tail = v_i[j_idx+1:]
-
-                # Apply the update
-                a_col -= scalar_v * u_tail + scalar_u * v_tail
+                a_col -= V_prev @ U[j_idx, :j_idx].T + U_prev @ V[j_idx, :j_idx].T
 
             # Compute the Householder vector
             u_j = np.zeros(trailing_size)
@@ -82,8 +74,12 @@ def block_householder_tridiagonalize(A, p):
         V_block = V[:, :block_size]
 
         A[start_col:, start_col:] -= U_block @ V_block.T + V_block @ U_block.T
+    
+    # Extract the tridiagonal part
+    D = np.diag(np.diag(A))
+    E = (np.diag(A, k=1) + np.diag(A, k=-1)) / 2
 
-    return A
+    return D, E
 
 # Function to perform non-blocked Householder tridiagonalization
 def householder_tridiagonalize(A):
@@ -99,18 +95,23 @@ def householder_tridiagonalize(A):
         sign = 1.0 if a[0] >= 0 else -1.0
         alpha = -sign * norm_a
 
-        u = np.zeros(n)
-        u[i+1] = np.sqrt((1 - a[0] / alpha))
-        u[i+2:] = -a[1:] / (alpha * u[i+1])
+        u = np.zeros(n - i)
+        u[0] = 0
+        u[1] = np.sqrt((1 - a[0] / alpha))
+        u[2:] = -a[1:] / (alpha * u[1])
 
         # Compute y and v
-        y = A @ u
+        y = A[i:, i:] @ u
         v = y - 0.5 * np.dot(y, u) * u
 
         # Apply symmetric rank-2 update
-        A = A - np.outer(u, v) - np.outer(v, u)
+        A[i:, i:] = A[i:, i:] - np.outer(u, v) - np.outer(v, u)
 
-    return A
+    # Extract the tridiagonal part
+    D = np.diag(np.diag(A))
+    E = (np.diag(A, k=1) + np.diag(A, k=-1)) / 2
+
+    return D, E
 
 def generate_symmetric_matrix(n, seed=None):
     if seed is not None:
@@ -130,7 +131,7 @@ def compare_methods(matrix_sizes, block_size=2, num_trials=5, seed=42):
         for _ in range(num_trials):
             A_copy = A.copy()
             start = time.time()
-            T_blocked = block_householder_tridiagonalize(A_copy, block_size)
+            D_blocked, E_blocked = block_householder_tridiagonalize(A_copy, block_size)
             blocked_times.append(time.time() - start)
         avg_blocked = np.mean(blocked_times)
         
@@ -139,12 +140,12 @@ def compare_methods(matrix_sizes, block_size=2, num_trials=5, seed=42):
         for _ in range(num_trials):
             A_copy = A.copy()
             start = time.time()
-            T_non_blocked = householder_tridiagonalize(A_copy)
+            D_non_blocked, E_non_blocked = householder_tridiagonalize(A_copy)
             non_blocked_times.append(time.time() - start)
         avg_non_blocked = np.mean(non_blocked_times)
-        
+
         # Verify correctness
-        diff = np.max(np.abs(T_blocked - T_non_blocked))
+        diff = max(np.max(np.abs(D_blocked - D_non_blocked)), np.max(np.abs(E_blocked - E_non_blocked)))
         
         results.append({
             'size': n,

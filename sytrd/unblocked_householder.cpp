@@ -15,7 +15,7 @@ __device__ inline float warp_reduce_sum(float val) {
 // 'uplo' determines if the matrix is lower or upper triangular
 // Computes the norm and constructs the Householder vector in parallel
 template<rocblas_fill uplo>
-__global__ void build_householder_u(int n, int i, const float* A, int lda, float* u, float* partial_sums, int m) {
+__global__ void build_householder_u(int trailing_size, int i, const float* A, int lda, float* u, float* partial_sums, int m) {
     cg::grid_group grid = cg::this_grid();
 
     extern __shared__ float sdata[]; // Shared memory for reduction
@@ -79,10 +79,10 @@ __global__ void build_householder_u(int n, int i, const float* A, int lda, float
     // Compute the norm of the vector
     float norm_a = sqrtf(partial_sums[0]);
 
-    // If the norm is very small, set u to a unit vector at i+1
+    // If the norm is very small, set u to a unit vector at position 1 (second element)
     if (norm_a < 1e-10f) {
-        if (gid < n) {
-            u[gid] = gid == i + 1 ? 1.0f : 0.0f;
+        if (gid < trailing_size) {
+            u[gid] = gid == 1 ? 1.0f : 0.0f;
         }
         return;
     }
@@ -102,17 +102,17 @@ __global__ void build_householder_u(int n, int i, const float* A, int lda, float
     float u_i1 = sqrtf(fmaxf(0.0f, 1.0f - a0 / alpha));
 
     // Build the Householder vector u
-    if (gid < n) {
-        if (gid <= i) {
+    if (gid < trailing_size) {
+        if (gid == 0) {
             u[gid] = 0.0f;
-        } else if (gid == i + 1) {
+        } else if (gid == 1) {
             u[gid] = u_i1;
         } else {
             float ai;
             if constexpr (uplo == rocblas_fill_lower) {
-                ai = A[gid + i * lda];
+                ai = A[(i + gid) + i * lda];
             } else {
-                ai = A[i + gid * lda];
+                ai = A[i + (i + gid) * lda];
             }
             u[gid] = -ai / (alpha * u_i1);
         }
@@ -220,24 +220,35 @@ extern "C" hipError_t hip_ssytrd(
     hipMalloc(&u, n * sizeof(float));
     hipMalloc(&y, n * sizeof(float));
     hipMalloc(&v, n * sizeof(float));
-
+    
     const float one = 1.0f;
     const float minus_one = -1.0f;
     const float zero = 0.0f;
 
     int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    if (blocks < 1) blocks = 1;
+    int max_blocks = (n + threads - 1) / threads;
     float* d_partial_sums = nullptr;
-    hipMalloc(&d_partial_sums, sizeof(float) * blocks);
+    hipMalloc(&d_partial_sums, sizeof(float) * max_blocks);
+
+    // Get warp size for the current device
+    int device_warp_size;
+    hipDeviceGetAttribute(&device_warp_size, hipDeviceAttributeWarpSize, 0);
 
     // Main loop: reduce each column/row to tridiagonal form
     for (int i = 0; i < n - 2; ++i) {
         int m = n - i - 1;
+        int trailing_size = n - i;  // Size of the trailing submatrix
+
+        // Calculate blocks needed for current trailing size
+        int blocks = (trailing_size + threads - 1) / threads;
+        if (blocks < 1) blocks = 1;
 
         {
-            size_t shmem_bytes = threads * sizeof(float);
-            void* args[] = { &n, &i, &dA, &lda, &u, &d_partial_sums, &m };
+            void* args[] = { &trailing_size, &i, &dA, &lda, &u, &d_partial_sums, &m };
+
+            // Calculate shared memory needed: one float per warp for reduction
+            size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
+            size_t shmem_bytes = warps_per_block * sizeof(float);
 
             // Build Householder vector for current column/row
             if (uplo == rocblas_fill_lower) {
@@ -247,31 +258,36 @@ extern "C" hipError_t hip_ssytrd(
                 hipLaunchCooperativeKernel((void*)build_householder_u<rocblas_fill_upper>,
                                            dim3(blocks), dim3(threads), args, shmem_bytes, 0);
             }
-            hipDeviceSynchronize();
         }
 
         // Compute y = A * u
-        rocblas_ssymv(handle, uplo, n, &one, dA, lda, u, 1, &zero, y, 1);
+        float* dA_trailing = dA + i * lda + i;  // Pointer to A[i:, i:] submatrix
+        
+        rocblas_ssymv(handle, uplo, trailing_size, &one, dA_trailing, lda, u, 1, &zero, y, 1);
 
         // Fused computation of v = y - 0.5 * (y^T * u) * u
         {
-            void* args[] = { &n, &y, &u, &v, &d_partial_sums };
-            size_t shmem_bytes = threads * sizeof(float);
+            void* args[] = { &trailing_size, &y, &u, &v, &d_partial_sums };
+            
+            // Calculate shared memory needed: one float per warp for reduction
+            size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
+            size_t shmem_bytes = warps_per_block * sizeof(float);
+
             hipLaunchCooperativeKernel((void*)fused_dot_compute_v_unblocked,
                                        dim3(blocks), dim3(threads), args, shmem_bytes, 0);
-            hipDeviceSynchronize();
         }
 
         // Symmetric rank-2 update: A = A - u*v^T - v*u^T
-        rocblas_ssyr2(handle, uplo, n, &minus_one, u, 1, v, 1, dA, lda);
+        rocblas_ssyr2(handle, uplo, trailing_size, &minus_one, u, 1, v, 1, dA_trailing, lda);
     }
 
     // Extract diagonal and off-diagonal elements to output arrays
+    int final_blocks = (n + threads - 1) / threads;
     if (uplo == rocblas_fill_lower) {
-        hipLaunchKernelGGL(extract_tridiag_unblocked<rocblas_fill_lower>, dim3(blocks), dim3(threads), 0, 0,
+        hipLaunchKernelGGL(extract_tridiag_unblocked<rocblas_fill_lower>, dim3(final_blocks), dim3(threads), 0, 0,
                            n, dA, lda, dD, dE);
     } else {
-        hipLaunchKernelGGL(extract_tridiag_unblocked<rocblas_fill_upper>, dim3(blocks), dim3(threads), 0, 0,
+        hipLaunchKernelGGL(extract_tridiag_unblocked<rocblas_fill_upper>, dim3(final_blocks), dim3(threads), 0, 0,
                            n, dA, lda, dD, dE);
     }
     hipDeviceSynchronize();

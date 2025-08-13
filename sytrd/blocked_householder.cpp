@@ -226,6 +226,10 @@ extern "C" hipError_t hip_block_ssytrd(
     int num_blocks = (n - 2 + block_size - 1) / block_size;
 
     int threads = 256;
+    
+    // Get warp size for the current device
+    int device_warp_size;
+    hipDeviceGetAttribute(&device_warp_size, hipDeviceAttributeWarpSize, 0);
 
     // Allocate workspace for U and V matrices (n x block_size each)
     float *dU, *dV;
@@ -264,16 +268,18 @@ extern "C" hipError_t hip_block_ssytrd(
             {
                 void* args[] = {&m, &j, &j_idx, &dA, &lda, &dU, &dV, &trailing_size, &a_col_vec, &u_vec, &d_block_sums};
 
-                size_t shared_bytes = threads * sizeof(float);
+                // Calculate shared memory needed: one float per warp for reduction
+                size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
+                size_t shmem_bytes = warps_per_block * sizeof(float);
+                
                 // Launch as cooperative kernel for lower or upper storage
                 if (uplo == rocblas_fill_lower) {
                     hipLaunchCooperativeKernel((void*)build_householder_vector<rocblas_fill_lower>,
-                                               dim3(blocks), dim3(threads), args, shared_bytes, 0);
+                                               dim3(blocks), dim3(threads), args, shmem_bytes, 0);
                 } else {
                     hipLaunchCooperativeKernel((void*)build_householder_vector<rocblas_fill_upper>,
-                                               dim3(blocks), dim3(threads), args, shared_bytes, 0);
+                                               dim3(blocks), dim3(threads), args, shmem_bytes, 0);
                 }
-                hipDeviceSynchronize();
             }
 
             // Compute y = (A - U_prev * V_prev^T - V_prev * U_prev^T) * u
@@ -300,10 +306,13 @@ extern "C" hipError_t hip_block_ssytrd(
             {
                 float *v_vec = dV + j_idx * trailing_size;
                 void* args[] = { &trailing_size, &y_vec, &u_vec, &v_vec, &d_block_sums };
-                size_t shmem_bytes = threads * sizeof(float);
+                
+                // Calculate shared memory needed: one float per warp for reduction
+                size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
+                size_t shmem_bytes = warps_per_block * sizeof(float);
+                
                 hipLaunchCooperativeKernel((void*)fused_dot_compute_v,
                                            dim3(blocks), dim3(threads), args, shmem_bytes, 0);
-                hipDeviceSynchronize();
             }
         }
 
