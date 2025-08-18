@@ -24,10 +24,9 @@ __device__ inline float warp_reduce_sum(float val) {
 }
 
 // Kernel to compute Householder reflector (larfg) for a column vector
-__global__ void larfg_kernel(int n, int i, float* __restrict__ A, int lda,
+__global__ void larfg_kernel(int m, int i, float* __restrict__ A, int lda,
                              float* __restrict__ dE, float* __restrict__ dTau,
                              float* __restrict__ partial_sums) {
-    int m = n - i - 1;
     cg::grid_group grid = cg::this_grid();
     extern __shared__ float sdata[];
 
@@ -35,15 +34,13 @@ __global__ void larfg_kernel(int n, int i, float* __restrict__ A, int lda,
     int bdim = blockDim.x;
     int gid  = blockIdx.x * bdim + tid;
 
-    float* col_base = A + (i + 1) + i * lda;
+    float* col_base = A + idx2D(i + 1, i, lda);
 
     float val, local = 0.0f;
 
     if (gid < m) {
         val = col_base[gid];
-        if (gid > 0) {
-            local = val * val;
-        }
+        local = gid > 0? val * val : 0.0f;
     }
     float tail_sum = warp_reduce_sum(local);
     int lane = tid & (warpSize - 1);
@@ -70,11 +67,11 @@ __global__ void larfg_kernel(int n, int i, float* __restrict__ A, int lda,
             if (lane == 0) partial_sums[0] = final_sum;
         }
     }
+    float alpha = col_base[0];
 
     grid.sync();
 
     float sigma2 = partial_sums[0];
-    float alpha = col_base[0];
     float beta, tau, scale;
     if (sigma2 < 1e-10f) {
         tau   = 0.0f;
@@ -159,12 +156,12 @@ __global__ void fused_dot_scale_axpy(int n,
 __global__ void setup_tridiagonal(int n, float* A, int lda, float* D, float* E) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        D[i] = A[i + i * lda];
+        D[i] = A[idx2D(i, i, lda)];
 
         if (i < n - 2) {
-            A[(i + 1) + i * lda] = E[i];
+            A[idx2D(i + 1, i, lda)] = E[i];
         } else if (i == n - 2) {
-            E[i] =  A[(i + 1) + i * lda];
+            E[i] =  A[idx2D(i + 1, i, lda)];
         }
     }
 }
@@ -181,34 +178,35 @@ extern "C" hipError_t hip_sytd2(
     float* dTau,
     int device_warp_size,
     float* w_vec,
-    float* d_partial_sums)
+    float* d_partial_sums,
+    const float* d_scalars)
 {
-    const float one = 1.0f;
-    const float zero = 0.0f;
-    const float minus_one = -1.0f;
-
     const int threads = 256;
 
-    for (int i = 0; i < n - 2; ++i) {
-        int m = n - i - 1;
+    for (int j = 0; j < n - 2; ++j) {
+        int m = n - j - 1;
         int blocks = (m + threads - 1) / threads;
+
         {
-            void* args[] = { &n, &i, &dA, &lda, &dE, &dTau, &d_partial_sums };
+            void* args[] = { &m, &j, &dA, &lda, &dE, &dTau, &d_partial_sums };
             size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
             size_t shmem_bytes = warps_per_block * sizeof(float);
             hipLaunchCooperativeKernel((void*)larfg_kernel, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
         }
-        float* A22 = dA + (i + 1) * lda + (i + 1);
-        float* v_vec = dA + (i + 1) + i * lda;
-        rocblas_ssymv(handle, rocblas_fill_lower, m, &one, A22, lda, v_vec, 1, &zero, w_vec, 1);
+
+        float* A22 = dA + idx2D(j + 1, j + 1, lda);
+        float* v_vec = dA + idx2D(j + 1, j, lda);
+        rocblas_ssymv(handle, rocblas_fill_lower, m, d_scalars + 0, A22, lda, v_vec, 1, d_scalars + 2, w_vec, 1);
+
         {
-            float *tau_ptr = dTau + i;
+            float *tau_ptr = dTau + j;
             void* args[] = { &m, &v_vec, &w_vec, &d_partial_sums, &tau_ptr };
             size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
             size_t shmem_bytes = warps_per_block * sizeof(float);
             hipLaunchCooperativeKernel((void*)fused_dot_scale_axpy, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
         }
-        rocblas_ssyr2(handle, rocblas_fill_lower, m, &minus_one, v_vec, 1, w_vec, 1, A22, lda);
+
+        rocblas_ssyr2(handle, rocblas_fill_lower, m, d_scalars + 1, v_vec, 1, w_vec, 1, A22, lda);
     }
 
     return hipSuccess;
@@ -249,12 +247,9 @@ extern "C" hipError_t hip_latrd(
     int panel_size,
     int device_warp_size,
     float* d_tmp_vec,
-    float* d_partial_sums)
+    float* d_partial_sums,
+    const float* d_scalars)
 {
-    const float one = 1.0f;
-    const float minus_one = -1.0f;
-    const float zero = 0.0f;
-
     const int threads = 256;
 
     for (int j = 0; j < panel_size; ++j) {
@@ -269,7 +264,7 @@ extern "C" hipError_t hip_latrd(
 
         int blocks = (m + threads - 1) / threads;
         {
-            void* args[] = { &n, &j, &dA, &lda, &dE, &dTau, &d_partial_sums };
+            void* args[] = { &m, &j, &dA, &lda, &dE, &dTau, &d_partial_sums };
             size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
             size_t shmem_bytes = warps_per_block * sizeof(float);
             hipLaunchCooperativeKernel((void*)larfg_kernel, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
@@ -278,20 +273,20 @@ extern "C" hipError_t hip_latrd(
         float* v_vec = dA + idx2D(j + 1, j, lda);
         float* w_vec = dW + idx2D(j + 1, j, ldw);
 
-        rocblas_ssymv(handle, uplo, m, &one, 
+        rocblas_ssymv(handle, uplo, m, d_scalars + 0,
                       dA + idx2D(j + 1, j + 1, lda), lda, 
-                      v_vec, 1, &zero, w_vec, 1);
+                      v_vec, 1, d_scalars + 2, w_vec, 1);
 
         if (j > 0) {
             rocblas_sgemv(handle, rocblas_operation_transpose, m, j,
-                          &one, dW + j + 1, ldw, v_vec, 1, &zero, d_tmp_vec, 1);
+                          d_scalars + 0, dW + j + 1, ldw, v_vec, 1, d_scalars + 2, d_tmp_vec, 1);
             rocblas_sgemv(handle, rocblas_operation_none, m, j,
-                          &minus_one, dA + j + 1, lda, d_tmp_vec, 1, &one, w_vec, 1);
+                          d_scalars + 1, dA + j + 1, lda, d_tmp_vec, 1, d_scalars + 0, w_vec, 1);
 
             rocblas_sgemv(handle, rocblas_operation_transpose, m, j,
-                          &one, dA + j + 1, lda, v_vec, 1, &zero, d_tmp_vec, 1);
+                          d_scalars + 0, dA + j + 1, lda, v_vec, 1, d_scalars + 2, d_tmp_vec, 1);
             rocblas_sgemv(handle, rocblas_operation_none, m, j,
-                          &minus_one, dW + j + 1, ldw, d_tmp_vec, 1, &one, w_vec, 1);
+                          d_scalars + 1, dW + j + 1, ldw, d_tmp_vec, 1, d_scalars + 0, w_vec, 1);
         }
 
         {
@@ -319,11 +314,14 @@ extern "C" hipError_t hip_ssytrd(
 {
     if (n < 3) return hipSuccess;
 
-    const float one = 1.0f;
-    const float minus_one = -1.0f;
-
     const int threads = 256;
     const int panel_size = 64;
+
+    // Allocate device memory for scalar constants
+    float h_scalars[3] = {1.0f, -1.0f, 0.0f};
+    float *d_scalars;
+    hipMalloc(&d_scalars, 3 * sizeof(float));
+    hipMemcpy(d_scalars, h_scalars, 3 * sizeof(float), hipMemcpyHostToDevice);
     
     int device_warp_size;
     hipDeviceGetAttribute(&device_warp_size, hipDeviceAttributeWarpSize, 0);
@@ -333,6 +331,7 @@ extern "C" hipError_t hip_ssytrd(
     hipMalloc(&d_tmp_vec, panel_size * sizeof(float));
     float* d_partial_sums;
     hipMalloc(&d_partial_sums, sizeof(float) * int((n + threads - 1) / threads));
+
     int j = 0;
     while(j < n - panel_size) {
         float* dA_panel = dA + idx2D(j, j, lda);
@@ -351,16 +350,17 @@ extern "C" hipError_t hip_ssytrd(
                   panel_size,
                   device_warp_size,
                   d_tmp_vec,
-                  d_partial_sums);
+                  d_partial_sums,
+                  d_scalars);
 
         j += panel_size;
 
         rocblas_ssyr2k(handle, uplo, rocblas_operation_none,
                        n - j, panel_size,
-                       &minus_one,
+                       d_scalars + 1, // minus_one
                        dA_panel + panel_size, lda,
                        dW + panel_size, ldw,
-                       &one,
+                       d_scalars + 0, // one
                        dA + idx2D(j, j, lda), lda);
     }
     if (j < n - 2) {
@@ -374,7 +374,8 @@ extern "C" hipError_t hip_ssytrd(
                   dTau + j,
                   device_warp_size,
                   dW,
-                  d_partial_sums);
+                  d_partial_sums,
+                  d_scalars);
     }
 
     int tridiag_blocks = (n + threads - 1) / threads;
@@ -385,6 +386,7 @@ extern "C" hipError_t hip_ssytrd(
     hipFree(dW);
     hipFree(d_tmp_vec);
     hipFree(d_partial_sums);
+    hipFree(d_scalars);
 
     return hipSuccess;
 }
@@ -506,11 +508,11 @@ BenchmarkResult benchmark(int n, bool validate, int iterations, int warmup) {
 void print_table_header(bool validate) {
     printf("Matrix Size |   hip_ssytrd (ms) | rocSOLVER (ms) |   Speedup");
     if (validate) {
-        printf(" |   max|ΔD|    |   max|ΔE|    |   max|ΔTau|\n");
-        printf("-----------------------------------------------------------------------------------------------\n");
+        printf(" |      max|ΔD| |      max|ΔE| |    max|ΔTau| \n");
+        printf("---------------------------------------------------------------------------------------------------------\n");
     } else {
         printf("\n");
-        printf("---------------------------------------------------------------\n");
+        printf("------------------------------------------------------------\n");
     }
 }
 
@@ -521,7 +523,7 @@ void print_comparison_result(int n, const BenchmarkResult& result, bool validate
            result.rocsolver_avg_time_ms,
            result.speedup_rocsolver_over_hip);
     if (validate && result.validated) {
-        printf(" | %11.3e | %11.3e | %13.3e",
+        printf(" | %12.3e | %12.3e | %12.3e",
                result.max_abs_diff_D,
                result.max_abs_diff_E,
                result.max_abs_diff_Tau);
