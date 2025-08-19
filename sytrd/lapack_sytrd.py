@@ -65,11 +65,8 @@ def latrd_lower_panel(A_panel, nb):
     W = np.zeros((Np, nb), dtype=A_panel.dtype, order='F')
 
     for i in range(nb):
-        # if i > 0:
-        #     A_panel[i:, i] -= A_panel[i:, :i] @ W[i, :i].T
-        #     A_panel[i:, i] -= W[i:, :i] @ A_panel[i, :i].T
-        for j in range(i):
-            A_panel[i:, i] -= A_panel[i:, j] * W[i, j] + W[i:, j] * A_panel[i, j]
+        if i > 0:
+            A_panel[i:, i] -= A_panel[i:, :i] @ W[i, :i].T + W[i:, :i] @ A_panel[i, :i].T
 
         beta, tau, _ = larfg(A_panel[i+1, i], A_panel[i+2:, i])
         E[i] = beta
@@ -82,10 +79,7 @@ def latrd_lower_panel(A_panel, nb):
             w = symv_lower(A22, v)
 
             if i > 0:
-                vtw = W[i+1:, :i].T @ v
-                w  -= A_panel[i+1:, :i] @ vtw
-                vtv = A_panel[i+1:, :i].T @ v
-                w  -= W[i+1:, :i] @ vtv
+                w -= A_panel[i+1:, :i] @ (W[i+1:, :i].T @ v) + W[i+1:, :i] @ (A_panel[i+1:, :i].T @ v)
 
             w *= tau
             alpha_corr = -0.5 * tau * np.dot(w, v)

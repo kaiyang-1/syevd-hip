@@ -212,26 +212,6 @@ extern "C" hipError_t hip_sytd2(
     return hipSuccess;
 }
 
-// Kernel to apply accumulated updates to trailing submatrix during panel reduction
-__global__ void apply_accumulate_updates(int vec_len, int j,
-                                         float* __restrict__ dA, int lda,
-                                         const float* __restrict__ dW, int ldw) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= vec_len) return;
-
-    int row = j + tid;
-
-    float accum = 0.0f;
-    for (int i = 0; i < j; ++i) {
-        float scalar_a = *(dA + idx2D(j, i, lda));
-        float scalar_w = *(dW + idx2D(j, i, ldw));
-        float a_tail = *(dA + idx2D(row, i, lda));
-        float w_tail = *(dW + idx2D(row, i, ldw));
-        accum += scalar_a * w_tail + scalar_w * a_tail;
-    }
-    dA[idx2D(row, j, lda)] -= accum;
-}
-
 // Blocked panel reduction for symmetric tridiagonalization
 extern "C" hipError_t hip_latrd(
     rocblas_handle handle,
@@ -256,10 +236,25 @@ extern "C" hipError_t hip_latrd(
         int m = n - j - 1;
 
         if (j > 0) {
-            int vec_len = n - j;
-            int blocks_updates = (vec_len + threads - 1) / threads;
-            hipLaunchKernelGGL(apply_accumulate_updates, dim3(blocks_updates), dim3(threads), 0, 0,
-                               vec_len, j, dA, lda, dW, ldw);
+            // Compute the update to column j of A
+            // A[j:, j] -= A[j:, :j] * W[j, :j]^T + W[j:, :j] * A[j, :j]^T
+            int len = n - j;
+
+            rocblas_sgemv(handle, rocblas_operation_none,
+                          len, j,
+                          d_scalars + 1, // -1.0f
+                          dA + j, lda,
+                          dW + j, ldw,
+                          d_scalars, // 0.0f
+                          dA + idx2D(j, j, lda), 1);
+
+            rocblas_sgemv(handle, rocblas_operation_none,
+                          len, j,
+                          d_scalars + 1, // -1.0f
+                          dW + j, ldw,
+                          dA + j, lda,
+                          d_scalars, // 0.0f
+                          dA + idx2D(j, j, lda), 1);
         }
 
         int blocks = (m + threads - 1) / threads;
@@ -273,6 +268,9 @@ extern "C" hipError_t hip_latrd(
         float* v_vec = dA + idx2D(j + 1, j, lda);
         float* w_vec = dW + idx2D(j + 1, j, ldw);
 
+        // w = A[j+1:, j+1:] @ v
+        //   - A[j+1:, :j] @ (W[j+1:, :j].T @ v)
+        //   - W[j+1:, :j] @ (A[j+1:, :j].T @ v)
         rocblas_ssymv(handle, uplo, m, d_scalars + 0,
                       dA + idx2D(j + 1, j + 1, lda), lda, 
                       v_vec, 1, d_scalars + 2, w_vec, 1);
@@ -297,7 +295,6 @@ extern "C" hipError_t hip_latrd(
             hipLaunchCooperativeKernel((void*)fused_dot_scale_axpy, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
         }
     }
-
     return hipSuccess;
 }
 
