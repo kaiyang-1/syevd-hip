@@ -95,6 +95,61 @@ __global__ void larfg_kernel(int m, int i, float* __restrict__ A, int lda,
     }
 }
 
+// Optimized single-block version for small vectors (m <= 2048)
+__global__ void larfg_kernel_small(int m, int i, float* __restrict__ A, int lda,
+                                   float* __restrict__ dE, float* __restrict__ dTau) {
+    extern __shared__ float sdata[]; // size >= blockDim.x
+    int tid = threadIdx.x;
+    float* col_base = A + idx2D(i + 1, i, lda);
+
+    // Accumulate sum of squares of tail (excluding first element)
+    float local_sum = 0.0f;
+    float alpha = 0.0f;
+    for (int idx = tid; idx < m; idx += blockDim.x) {
+        float val = col_base[idx];
+        if (idx == 0) alpha = val; else local_sum += val * val;
+    }
+
+    // Reduction within block for local_sum
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) sdata[tid] += sdata[tid + offset];
+        __syncthreads();
+    }
+    float sigma2 = sdata[0];
+
+    // Broadcast alpha to all threads (alpha only known by threads that saw idx==0)
+    // Use shared memory position 1 for alpha broadcast if needed.
+    if (tid == 0) sdata[1] = alpha;
+    __syncthreads();
+    alpha = sdata[1];
+
+    float beta, tau, scale;
+    if (sigma2 < 1e-10f) {
+        tau = 0.0f;
+        beta = alpha;
+        scale = 0.0f;
+    } else {
+        float sigma = sqrtf(sigma2);
+        float r = hypotf(alpha, sigma);
+        beta = -copysignf(r, alpha == 0.0f ? 1.0f : alpha);
+        tau = (beta - alpha) / beta;
+        scale = 1.0f / (alpha - beta);
+    }
+
+    // Store tau & beta
+    if (tid == 0) {
+        dE[i] = beta;
+        dTau[i] = tau;
+    }
+
+    // Scale tail and set first element = 1
+    for (int idx = tid; idx < m; idx += blockDim.x) {
+        if (idx == 0) col_base[0] = 1.0f; else col_base[idx] *= scale;
+    }
+}
+
 // Kernel to compute dot product, scale, and axpy in a fused manner
 __global__ void fused_dot_scale_axpy(int n,
                                      const float* __restrict__ v,
@@ -152,6 +207,46 @@ __global__ void fused_dot_scale_axpy(int n,
     }
 }
 
+// Optimized single-block version for small vectors (n <= 2048)
+__global__ void fused_dot_scale_axpy_small(int n,
+                                           const float* __restrict__ v,
+                                           float* __restrict__ w,
+                                           const float* __restrict__ tau_ptr) {
+    extern __shared__ float sdata[]; // size >= blockDim.x
+    int tid = threadIdx.x;
+    float tau = *tau_ptr;
+
+    // Compute dot product within single block
+    float local_dot = 0.0f;
+    float w_val = 0.0f;
+    float v_val = 0.0f;
+    
+    for (int idx = tid; idx < n; idx += blockDim.x) {
+        w_val = w[idx];
+        v_val = v[idx];
+        local_dot += w_val * v_val;
+    }
+
+    // Reduction within block for dot product
+    sdata[tid] = local_dot;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) sdata[tid] += sdata[tid + offset];
+        __syncthreads();
+    }
+    float dot = sdata[0];
+
+    // Compute correction factor
+    float alpha_corr = -0.5f * tau * dot;
+
+    // Apply fused scale and axpy operation
+    for (int idx = tid; idx < n; idx += blockDim.x) {
+        w_val = w[idx];
+        v_val = v[idx];
+        w[idx] = tau * (w_val + alpha_corr * v_val);
+    }
+}
+
 // Kernel to set up tridiagonal matrix elements D and E from A
 __global__ void setup_tridiagonal(int n, float* A, int lda, float* D, float* E) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -187,7 +282,12 @@ extern "C" hipError_t hip_sytd2(
         int m = n - j - 1;
         int blocks = (m + threads - 1) / threads;
 
-        {
+        if (m <= 2048) {
+            dim3 blk(256); dim3 grd(1);
+            size_t shmem_bytes = 256 * sizeof(float);
+            hipLaunchKernelGGL(larfg_kernel_small, grd, blk, shmem_bytes, 0,
+                               m, j, dA, lda, dE, dTau);
+        } else {
             void* args[] = { &m, &j, &dA, &lda, &dE, &dTau, &d_partial_sums };
             size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
             size_t shmem_bytes = warps_per_block * sizeof(float);
@@ -200,10 +300,18 @@ extern "C" hipError_t hip_sytd2(
 
         {
             float *tau_ptr = dTau + j;
-            void* args[] = { &m, &v_vec, &w_vec, &d_partial_sums, &tau_ptr };
-            size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
-            size_t shmem_bytes = warps_per_block * sizeof(float);
-            hipLaunchCooperativeKernel((void*)fused_dot_scale_axpy, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
+            if (m <= 2048) {
+                // Single-block optimized path
+                dim3 blk(256); dim3 grd(1);
+                size_t shmem_bytes = 256 * sizeof(float);
+                hipLaunchKernelGGL(fused_dot_scale_axpy_small, grd, blk, shmem_bytes, 0,
+                                   m, v_vec, w_vec, tau_ptr);
+            } else {
+                void* args[] = { &m, &v_vec, &w_vec, &d_partial_sums, &tau_ptr };
+                size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
+                size_t shmem_bytes = warps_per_block * sizeof(float);
+                hipLaunchCooperativeKernel((void*)fused_dot_scale_axpy, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
+            }
         }
 
         rocblas_ssyr2(handle, rocblas_fill_lower, m, d_scalars + 1, v_vec, 1, w_vec, 1, A22, lda);
@@ -245,7 +353,7 @@ extern "C" hipError_t hip_latrd(
                           d_scalars + 1, // -1.0f
                           dA + j, lda,
                           dW + j, ldw,
-                          d_scalars, // 0.0f
+                          d_scalars, // 1.0f
                           dA + idx2D(j, j, lda), 1);
 
             rocblas_sgemv(handle, rocblas_operation_none,
@@ -253,12 +361,19 @@ extern "C" hipError_t hip_latrd(
                           d_scalars + 1, // -1.0f
                           dW + j, ldw,
                           dA + j, lda,
-                          d_scalars, // 0.0f
+                          d_scalars, // 1.0f
                           dA + idx2D(j, j, lda), 1);
         }
 
         int blocks = (m + threads - 1) / threads;
-        {
+
+        if (m <= 2048) {
+            // Single-block optimized path
+            dim3 blk(256); dim3 grd(1);
+            size_t shmem_bytes = 256 * sizeof(float);
+            hipLaunchKernelGGL(larfg_kernel_small, grd, blk, shmem_bytes, 0,
+                               m, j, dA, lda, dE, dTau);
+        } else {
             void* args[] = { &m, &j, &dA, &lda, &dE, &dTau, &d_partial_sums };
             size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
             size_t shmem_bytes = warps_per_block * sizeof(float);
@@ -289,10 +404,19 @@ extern "C" hipError_t hip_latrd(
 
         {
             float *tau_ptr = dTau + j;
-            void* args[] = { &m, &v_vec, &w_vec, &d_partial_sums, &tau_ptr };
-            size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
-            size_t shmem_bytes = warps_per_block * sizeof(float);
-            hipLaunchCooperativeKernel((void*)fused_dot_scale_axpy, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
+            if (m <= 2048) {
+                // Single-block optimized path
+                dim3 blk(256); dim3 grd(1);
+                size_t shmem_bytes = 256 * sizeof(float);
+                hipLaunchKernelGGL(fused_dot_scale_axpy_small, grd, blk, shmem_bytes, 0,
+                                   m, v_vec, w_vec, tau_ptr);
+            } else {
+                int blocks = (m + threads - 1) / threads;
+                void* args[] = { &m, &v_vec, &w_vec, &d_partial_sums, &tau_ptr };
+                size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
+                size_t shmem_bytes = warps_per_block * sizeof(float);
+                hipLaunchCooperativeKernel((void*)fused_dot_scale_axpy, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
+            }
         }
     }
     return hipSuccess;
