@@ -12,15 +12,43 @@
 #include <cstring>
 namespace cg = cooperative_groups;
 
+#define CEIL_DIV(x, y) ((x) >= 0 ? (((x) + (y) - 1) / (y)) : ((x) / (y)))
+
 // 2D index calculation for column-major storage
 __device__ __host__ inline int idx2D(const int i, const int j, const int lda) { return j * lda + i; }
 
-// Warp-level reduction for summing values within a warp
-__device__ inline float warp_reduce_sum(float val) {
+// Warp-level reduction
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
         val += __shfl_down(val, offset);
     }
     return val;
+}
+
+// Block-level reduction
+__device__ __forceinline__ void block_reduce_sum(float val, float *smem, int tid, int blockDimX) {
+    val = warp_reduce_sum(val);
+
+    if (blockDimX > warpSize) {
+        int lane = tid & (warpSize - 1);
+        int wid = tid / warpSize;
+        if (lane == 0) {
+            smem[wid] = val;
+        }
+        __syncthreads();
+
+        if (tid < warpSize) {
+            val = tid < CEIL_DIV(blockDimX, warpSize) ? smem[tid] : 0.0f;
+            val = warp_reduce_sum(val);
+            if (tid == 0) smem[0] = val;
+        }
+    } else {
+        if (tid == 0) smem[0] = val;
+    }
+
+    // __syncthreads();
+    // sync not needed if only thread 0 reads from smem[0]
 }
 
 // Kernel to compute Householder reflector (larfg) for a column vector
@@ -42,30 +70,18 @@ __global__ void larfg_kernel(int m, int i, float* __restrict__ A, int lda,
         val = col_base[gid];
         local = gid > 0? val * val : 0.0f;
     }
-    float tail_sum = warp_reduce_sum(local);
-    int lane = tid & (warpSize - 1);
-    int wid  = tid / warpSize;
-    if (lane == 0) sdata[wid] = tail_sum;
-    __syncthreads();
-    if (wid == 0) {
-        float block_sum = (lane < (bdim + warpSize - 1) / warpSize) ? sdata[lane] : 0.0f;
-        block_sum = warp_reduce_sum(block_sum);
-        if (lane == 0) partial_sums[blockIdx.x] = block_sum;
-    }
+    
+    block_reduce_sum(local, sdata, tid, bdim);
+    if (tid == 0) partial_sums[blockIdx.x] = sdata[0];
 
     grid.sync();
 
     if (blockIdx.x == 0) {
         float ps = 0.0f;
         for (int idx = tid; idx < gridDim.x; idx += bdim) ps += partial_sums[idx];
-        float reduced = warp_reduce_sum(ps);
-        if (lane == 0) sdata[wid] = reduced;
-        __syncthreads();
-        if (wid == 0) {
-            float final_sum = (lane < (bdim + warpSize - 1)/warpSize) ? sdata[lane] : 0.0f;
-            final_sum = warp_reduce_sum(final_sum);
-            if (lane == 0) partial_sums[0] = final_sum;
-        }
+        
+        block_reduce_sum(ps, sdata, tid, bdim);
+        if (tid == 0) partial_sums[0] = sdata[0];
     }
     float alpha = col_base[0];
 
@@ -98,7 +114,7 @@ __global__ void larfg_kernel(int m, int i, float* __restrict__ A, int lda,
 // Optimized single-block version for small vectors (m <= 2048)
 __global__ void larfg_kernel_small(int m, int i, float* __restrict__ A, int lda,
                                    float* __restrict__ dE, float* __restrict__ dTau) {
-    extern __shared__ float sdata[]; // size >= blockDim.x
+    extern __shared__ float sdata[];
     int tid = threadIdx.x;
     float* col_base = A + idx2D(i + 1, i, lda);
 
@@ -111,12 +127,8 @@ __global__ void larfg_kernel_small(int m, int i, float* __restrict__ A, int lda,
     }
 
     // Reduction within block for local_sum
-    sdata[tid] = local_sum;
+    block_reduce_sum(local_sum, sdata, tid, blockDim.x);
     __syncthreads();
-    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-        if (tid < offset) sdata[tid] += sdata[tid + offset];
-        __syncthreads();
-    }
     float sigma2 = sdata[0];
 
     // Broadcast alpha to all threads (alpha only known by threads that saw idx==0)
@@ -171,30 +183,18 @@ __global__ void fused_dot_scale_axpy(int n,
     }
 
     float prod = w_val * v_val;
-    float wsum = warp_reduce_sum(prod);
-    int lane = tid & (warpSize - 1);
-    int wid  = tid / warpSize;
-    if (lane == 0) sdata[wid] = wsum;
-    __syncthreads();
-    if (wid == 0) {
-        float block_sum = (lane < (blockDim.x + warpSize - 1)/warpSize) ? sdata[lane] : 0.0f;
-        block_sum = warp_reduce_sum(block_sum);
-        if (lane == 0) partial_sums[blockIdx.x] = block_sum;
-    }
+    
+    block_reduce_sum(prod, sdata, tid, blockDim.x);
+    if (tid == 0) partial_sums[blockIdx.x] = sdata[0];
 
     grid.sync();
 
     if (blockIdx.x == 0) {
         float sum = 0.0f;
         for (int idx = tid; idx < gridDim.x; idx += blockDim.x) sum += partial_sums[idx];
-        float red = warp_reduce_sum(sum);
-        if (lane == 0) sdata[wid] = red;
-        __syncthreads();
-        if (wid == 0) {
-            float final_sum = (lane < (blockDim.x + warpSize - 1)/warpSize) ? sdata[lane] : 0.0f;
-            final_sum = warp_reduce_sum(final_sum);
-            if (lane == 0) partial_sums[0] = final_sum;
-        }
+        
+        block_reduce_sum(sum, sdata, tid, blockDim.x);
+        if (tid == 0) partial_sums[0] = sdata[0];
     }
 
     grid.sync();
@@ -212,7 +212,7 @@ __global__ void fused_dot_scale_axpy_small(int n,
                                            const float* __restrict__ v,
                                            float* __restrict__ w,
                                            const float* __restrict__ tau_ptr) {
-    extern __shared__ float sdata[]; // size >= blockDim.x
+    extern __shared__ float sdata[];
     int tid = threadIdx.x;
     float tau = *tau_ptr;
 
@@ -228,12 +228,8 @@ __global__ void fused_dot_scale_axpy_small(int n,
     }
 
     // Reduction within block for dot product
-    sdata[tid] = local_dot;
+    block_reduce_sum(local_dot, sdata, tid, blockDim.x);
     __syncthreads();
-    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-        if (tid < offset) sdata[tid] += sdata[tid + offset];
-        __syncthreads();
-    }
     float dot = sdata[0];
 
     // Compute correction factor
@@ -277,20 +273,18 @@ extern "C" hipError_t hip_sytd2(
     const float* d_scalars)
 {
     const int threads = 256;
+    size_t shmem_bytes = CEIL_DIV(threads, device_warp_size) * sizeof(float);
 
     for (int j = 0; j < n - 2; ++j) {
         int m = n - j - 1;
-        int blocks = (m + threads - 1) / threads;
+        int blocks = CEIL_DIV(m, threads);
 
         if (m <= 2048) {
-            dim3 blk(256); dim3 grd(1);
-            size_t shmem_bytes = 256 * sizeof(float);
+            dim3 blk(threads); dim3 grd(1);
             hipLaunchKernelGGL(larfg_kernel_small, grd, blk, shmem_bytes, 0,
                                m, j, dA, lda, dE, dTau);
         } else {
             void* args[] = { &m, &j, &dA, &lda, &dE, &dTau, &d_partial_sums };
-            size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
-            size_t shmem_bytes = warps_per_block * sizeof(float);
             hipLaunchCooperativeKernel((void*)larfg_kernel, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
         }
 
@@ -302,14 +296,11 @@ extern "C" hipError_t hip_sytd2(
             float *tau_ptr = dTau + j;
             if (m <= 2048) {
                 // Single-block optimized path
-                dim3 blk(256); dim3 grd(1);
-                size_t shmem_bytes = 256 * sizeof(float);
+                dim3 blk(threads); dim3 grd(1);
                 hipLaunchKernelGGL(fused_dot_scale_axpy_small, grd, blk, shmem_bytes, 0,
                                    m, v_vec, w_vec, tau_ptr);
             } else {
                 void* args[] = { &m, &v_vec, &w_vec, &d_partial_sums, &tau_ptr };
-                size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
-                size_t shmem_bytes = warps_per_block * sizeof(float);
                 hipLaunchCooperativeKernel((void*)fused_dot_scale_axpy, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
             }
         }
@@ -318,6 +309,25 @@ extern "C" hipError_t hip_sytd2(
     }
 
     return hipSuccess;
+}
+
+__global__ void apply_accumulate_updates(int len, int j,
+                                         float* __restrict__ dA, int lda,
+                                         const float* __restrict__ dW, int ldw) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= len) return;
+
+    int row = j + tid;
+
+    float accum = 0.0f;
+    for (int i = 0; i < j; ++i) {
+        float scalar_a = *(dA + idx2D(j, i, lda));
+        float scalar_w = *(dW + idx2D(j, i, ldw));
+        float a_tail = *(dA + idx2D(row, i, lda));
+        float w_tail = *(dW + idx2D(row, i, ldw));
+        accum += scalar_a * w_tail + scalar_w * a_tail;
+    }
+    dA[idx2D(row, j, lda)] -= accum;
 }
 
 // Blocked panel reduction for symmetric tridiagonalization
@@ -339,6 +349,7 @@ extern "C" hipError_t hip_latrd(
     const float* d_scalars)
 {
     const int threads = 256;
+    size_t shmem_bytes = CEIL_DIV(threads, device_warp_size) * sizeof(float);
 
     for (int j = 0; j < panel_size; ++j) {
         int m = n - j - 1;
@@ -347,36 +358,20 @@ extern "C" hipError_t hip_latrd(
             // Compute the update to column j of A
             // A[j:, j] -= A[j:, :j] * W[j, :j]^T + W[j:, :j] * A[j, :j]^T
             int len = n - j;
-
-            rocblas_sgemv(handle, rocblas_operation_none,
-                          len, j,
-                          d_scalars + 1, // -1.0f
-                          dA + j, lda,
-                          dW + j, ldw,
-                          d_scalars, // 1.0f
-                          dA + idx2D(j, j, lda), 1);
-
-            rocblas_sgemv(handle, rocblas_operation_none,
-                          len, j,
-                          d_scalars + 1, // -1.0f
-                          dW + j, ldw,
-                          dA + j, lda,
-                          d_scalars, // 1.0f
-                          dA + idx2D(j, j, lda), 1);
+            int blocks_updates = CEIL_DIV(len, threads);
+            hipLaunchKernelGGL(apply_accumulate_updates, dim3(blocks_updates), dim3(threads), 0, 0,
+                               len, j, dA, lda, dW, ldw);
         }
 
-        int blocks = (m + threads - 1) / threads;
+        int blocks = CEIL_DIV(m, threads);
 
         if (m <= 2048) {
             // Single-block optimized path
-            dim3 blk(256); dim3 grd(1);
-            size_t shmem_bytes = 256 * sizeof(float);
+            dim3 blk(threads); dim3 grd(1);
             hipLaunchKernelGGL(larfg_kernel_small, grd, blk, shmem_bytes, 0,
                                m, j, dA, lda, dE, dTau);
         } else {
             void* args[] = { &m, &j, &dA, &lda, &dE, &dTau, &d_partial_sums };
-            size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
-            size_t shmem_bytes = warps_per_block * sizeof(float);
             hipLaunchCooperativeKernel((void*)larfg_kernel, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
         }
 
@@ -406,15 +401,11 @@ extern "C" hipError_t hip_latrd(
             float *tau_ptr = dTau + j;
             if (m <= 2048) {
                 // Single-block optimized path
-                dim3 blk(256); dim3 grd(1);
-                size_t shmem_bytes = 256 * sizeof(float);
+                dim3 blk(threads); dim3 grd(1);
                 hipLaunchKernelGGL(fused_dot_scale_axpy_small, grd, blk, shmem_bytes, 0,
                                    m, v_vec, w_vec, tau_ptr);
             } else {
-                int blocks = (m + threads - 1) / threads;
                 void* args[] = { &m, &v_vec, &w_vec, &d_partial_sums, &tau_ptr };
-                size_t warps_per_block = (threads + device_warp_size - 1) / device_warp_size;
-                size_t shmem_bytes = warps_per_block * sizeof(float);
                 hipLaunchCooperativeKernel((void*)fused_dot_scale_axpy, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
             }
         }
@@ -451,7 +442,7 @@ extern "C" hipError_t hip_ssytrd(
     float* d_tmp_vec;
     hipMalloc(&d_tmp_vec, panel_size * sizeof(float));
     float* d_partial_sums;
-    hipMalloc(&d_partial_sums, sizeof(float) * int((n + threads - 1) / threads));
+    hipMalloc(&d_partial_sums, sizeof(float) * CEIL_DIV(n, threads));
 
     int j = 0;
     while(j < n - panel_size) {
@@ -499,7 +490,7 @@ extern "C" hipError_t hip_ssytrd(
                   d_scalars);
     }
 
-    int tridiag_blocks = (n + threads - 1) / threads;
+    int tridiag_blocks = CEIL_DIV(n, threads);
     hipLaunchKernelGGL(setup_tridiagonal, dim3(tridiag_blocks), dim3(threads), 0, 0,
                        n, dA, lda, dD, dE);
     hipMemset(dTau + n - 2, 0, sizeof(float));
