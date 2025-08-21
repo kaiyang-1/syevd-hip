@@ -257,6 +257,42 @@ __global__ void setup_tridiagonal(int n, float* A, int lda, float* D, float* E) 
     }
 }
 
+// Kernel to compute small-size symmetric-matrix-vector multiplication in single block
+__global__ void small_ssymv_kernel(int n,
+                                   float alpha,
+                                   const float* __restrict__ A, int lda,
+                                   const float* __restrict__ v,
+                                   float beta,
+                                   float* __restrict__ w) {
+    int tid = threadIdx.x;
+    int row = blockIdx.x * blockDim.x + tid;
+    
+    extern __shared__ float sv[];
+    
+    if (tid < n) {
+        sv[tid] = v[tid];
+    }
+    __syncthreads();
+    
+    if (row >= n) return;
+    
+    float sum = 0.0f;
+    
+    #pragma unroll 8
+    for (int col = 0; col <= row; ++col) {
+        float a_val = A[idx2D(row, col, lda)];
+        sum += a_val * sv[col];
+    }
+    
+    #pragma unroll 8  
+    for (int col = row + 1; col < n; ++col) {
+        float a_val = A[idx2D(col, row, lda)];
+        sum += a_val * sv[col];
+    }
+    
+    w[row] = (beta == 0.0f) ? alpha * sum : alpha * sum + beta * w[row];
+}
+
 // Unblocked symmetric tridiagonal reduction (panel size = 1)
 extern "C" hipError_t hip_sytd2(
     rocblas_handle handle,
@@ -290,7 +326,13 @@ extern "C" hipError_t hip_sytd2(
 
         float* A22 = dA + idx2D(j + 1, j + 1, lda);
         float* v_vec = dA + idx2D(j + 1, j, lda);
-        rocblas_ssymv(handle, rocblas_fill_lower, m, d_scalars + 0, A22, lda, v_vec, 1, d_scalars + 2, w_vec, 1);
+        if (m > 64) {
+            rocblas_ssymv(handle, rocblas_fill_lower, m, d_scalars + 0, A22, lda, v_vec, 1, d_scalars + 2, w_vec, 1);
+        } else {
+            int symv_blocks = CEIL_DIV(m, 64);
+            hipLaunchKernelGGL(small_ssymv_kernel, dim3(symv_blocks), dim3(64), m * sizeof(float), 0,
+                               m, 1.0f, A22, lda, v_vec, 0.0f, w_vec);
+        }
 
         {
             float *tau_ptr = dTau + j;
@@ -311,23 +353,96 @@ extern "C" hipError_t hip_sytd2(
     return hipSuccess;
 }
 
-__global__ void apply_accumulate_updates(int len, int j,
-                                         float* __restrict__ dA, int lda,
-                                         const float* __restrict__ dW, int ldw) {
+__global__ void accumulate_column_updates(int len, int j,
+                                          float* __restrict__ dA, int lda,
+                                          const float* __restrict__ dW, int ldw) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    extern __shared__ float shmem[];
+    float* sA = shmem;
+    float* sW = shmem + j;
+
+    for (int k = threadIdx.x; k < j; k += blockDim.x) {
+        sA[k] = dA[idx2D(j, k, lda)];
+        sW[k] = dW[idx2D(j, k, ldw)];
+    }
+    __syncthreads();
+
     if (tid >= len) return;
 
     int row = j + tid;
-
     float accum = 0.0f;
-    for (int i = 0; i < j; ++i) {
-        float scalar_a = *(dA + idx2D(j, i, lda));
-        float scalar_w = *(dW + idx2D(j, i, ldw));
-        float a_tail = *(dA + idx2D(row, i, lda));
-        float w_tail = *(dW + idx2D(row, i, ldw));
-        accum += scalar_a * w_tail + scalar_w * a_tail;
+    for (int k = 0; k < j; ++k) {
+        float a_tail = dA[idx2D(row, k, lda)];
+        float w_tail = dW[idx2D(row, k, ldw)];
+        accum += sA[k] * w_tail + sW[k] * a_tail;
     }
     dA[idx2D(row, j, lda)] -= accum;
+}
+
+__global__ void fused_transpose_gemv_kernel(int m, int j,
+                                            const float* __restrict__ A, int lda,
+                                            const float* __restrict__ W, int ldw,
+                                            const float* __restrict__ v,
+                                            float* __restrict__ tmp_vec)
+{
+    int col = blockIdx.x;
+    int tid = threadIdx.x;
+        
+    extern __shared__ float sdata[];
+    
+    float w_sum = 0.0f;
+    float a_sum = 0.0f;
+    
+    for (int row = tid; row < m; row += blockDim.x) {
+        float w_val = W[idx2D(row, col, ldw)];
+        float a_val = A[idx2D(row, col, lda)];
+        float v_val = v[row];
+        
+        w_sum += w_val * v_val;
+        a_sum += a_val * v_val;
+    }
+        
+    // Reduction within block for dot product
+    block_reduce_sum(w_sum, sdata, tid, blockDim.x);
+    if (tid == 0) {
+        tmp_vec[col] = sdata[0];
+    }
+    
+    block_reduce_sum(a_sum, sdata, tid, blockDim.x);
+    if (tid == 0) {
+        tmp_vec[col + j] = sdata[0];
+    }
+}
+
+__global__ void fused_gemv_kernel(int m, int j,
+                                  const float* __restrict__ A, int lda,
+                                  const float* __restrict__ W, int ldw,
+                                  const float* __restrict__ tmp_vec,
+                                  float* __restrict__ w) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    extern __shared__ float sdata[];
+    float* stmp1 = sdata;      // tmp1 = W^T*v
+    float* stmp2 = sdata + j;  // tmp2 = A^T*v
+    
+    for (int i = threadIdx.x; i < j; i += blockDim.x) {
+        stmp1[i] = tmp_vec[i];
+        stmp2[i] = tmp_vec[j + i];
+    }
+    __syncthreads();
+
+    if (row >= m) return;
+    
+    float sum = 0.0f;
+    
+    for (int col = 0; col < j; ++col) {
+        float a_val = A[idx2D(row, col, lda)];
+        float w_val = W[idx2D(row, col, ldw)];
+        sum += a_val * stmp1[col] + w_val * stmp2[col];
+    }
+    
+    w[row] -= sum;
 }
 
 // Blocked panel reduction for symmetric tridiagonalization
@@ -359,7 +474,8 @@ extern "C" hipError_t hip_latrd(
             // A[j:, j] -= A[j:, :j] * W[j, :j]^T + W[j:, :j] * A[j, :j]^T
             int len = n - j;
             int blocks_updates = CEIL_DIV(len, threads);
-            hipLaunchKernelGGL(apply_accumulate_updates, dim3(blocks_updates), dim3(threads), 0, 0,
+            size_t shmem_updates = 2 * j * sizeof(float);
+            hipLaunchKernelGGL(accumulate_column_updates, dim3(blocks_updates), dim3(threads), shmem_updates, 0,
                                len, j, dA, lda, dW, ldw);
         }
 
@@ -385,16 +501,12 @@ extern "C" hipError_t hip_latrd(
                       dA + idx2D(j + 1, j + 1, lda), lda, 
                       v_vec, 1, d_scalars + 2, w_vec, 1);
 
-        if (j > 0) {
-            rocblas_sgemv(handle, rocblas_operation_transpose, m, j,
-                          d_scalars + 0, dW + j + 1, ldw, v_vec, 1, d_scalars + 2, d_tmp_vec, 1);
-            rocblas_sgemv(handle, rocblas_operation_none, m, j,
-                          d_scalars + 1, dA + j + 1, lda, d_tmp_vec, 1, d_scalars + 0, w_vec, 1);
+        if (j > 0) {            
+            hipLaunchKernelGGL(fused_transpose_gemv_kernel, dim3(j), dim3(threads), shmem_bytes, 0,
+                               m, j, dA + j + 1, lda, dW + j + 1, ldw, v_vec, d_tmp_vec);
 
-            rocblas_sgemv(handle, rocblas_operation_transpose, m, j,
-                          d_scalars + 0, dA + j + 1, lda, v_vec, 1, d_scalars + 2, d_tmp_vec, 1);
-            rocblas_sgemv(handle, rocblas_operation_none, m, j,
-                          d_scalars + 1, dW + j + 1, ldw, d_tmp_vec, 1, d_scalars + 0, w_vec, 1);
+            hipLaunchKernelGGL(fused_gemv_kernel, dim3(CEIL_DIV(m, 256)), dim3(256), 2*j*sizeof(float), 0,
+                               m, j, dA + j + 1, lda, dW + j + 1, ldw, d_tmp_vec, w_vec);
         }
 
         {
@@ -440,7 +552,7 @@ extern "C" hipError_t hip_ssytrd(
     float* dW;
     hipMalloc(&dW, n * panel_size * sizeof(float));
     float* d_tmp_vec;
-    hipMalloc(&d_tmp_vec, panel_size * sizeof(float));
+    hipMalloc(&d_tmp_vec, 2 * panel_size * sizeof(float));
     float* d_partial_sums;
     hipMalloc(&d_partial_sums, sizeof(float) * CEIL_DIV(n, threads));
 
