@@ -293,7 +293,7 @@ __global__ void small_ssymv_kernel(int n,
     w[row] = (beta == 0.0f) ? alpha * sum : alpha * sum + beta * w[row];
 }
 
-// Unblocked symmetric tridiagonal reduction (panel size = 1)
+// Unblocked symmetric tridiagonal reduction
 extern "C" hipError_t hip_sytd2(
     rocblas_handle handle,
     rocblas_fill uplo,
@@ -324,6 +324,7 @@ extern "C" hipError_t hip_sytd2(
             hipLaunchCooperativeKernel((void*)larfg_kernel, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
         }
 
+        // w = A[j+1:, j+1:] @ v
         float* A22 = dA + idx2D(j + 1, j + 1, lda);
         float* v_vec = dA + idx2D(j + 1, j, lda);
         if (m > 64) {
@@ -334,6 +335,7 @@ extern "C" hipError_t hip_sytd2(
                                m, 1.0f, A22, lda, v_vec, 0.0f, w_vec);
         }
 
+        // w = tau * (w - 0.5 * tau * dot(w, v) * v)
         {
             float *tau_ptr = dTau + j;
             if (m <= 2048) {
@@ -347,15 +349,17 @@ extern "C" hipError_t hip_sytd2(
             }
         }
 
+        // A[j+1:, j+1:] -= v * w^T + w * v^T
         rocblas_ssyr2(handle, rocblas_fill_lower, m, d_scalars + 1, v_vec, 1, w_vec, 1, A22, lda);
     }
 
     return hipSuccess;
 }
 
-__global__ void accumulate_column_updates(int len, int j,
-                                          float* __restrict__ dA, int lda,
-                                          const float* __restrict__ dW, int ldw) {
+// Compute the update to column j of A
+__global__ void accumulate_a_col_updates(int len, int j,
+                                         float* __restrict__ dA, int lda,
+                                         const float* __restrict__ dW, int ldw) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
     extern __shared__ float shmem[];
@@ -380,46 +384,61 @@ __global__ void accumulate_column_updates(int len, int j,
     dA[idx2D(row, j, lda)] -= accum;
 }
 
-__global__ void fused_transpose_gemv_kernel(int m, int j,
-                                            const float* __restrict__ A, int lda,
-                                            const float* __restrict__ W, int ldw,
-                                            const float* __restrict__ v,
-                                            float* __restrict__ tmp_vec)
-{
+__global__ void compute_w_col_kernel(int m, int j,
+                                     const float* __restrict__ A22, int lda,
+                                     const float* __restrict__ A,
+                                     const float* __restrict__ W, int ldw,
+                                     const float* __restrict__ v,
+                                     float* __restrict__ w,
+                                     float* __restrict__ tmp_vec) {
     int col = blockIdx.x;
     int tid = threadIdx.x;
-        
-    extern __shared__ float sdata[];
     
+    extern __shared__ float sdata[];
+
     float w_sum = 0.0f;
     float a_sum = 0.0f;
-    
+    float symv_sum = 0.0f;
+
     for (int row = tid; row < m; row += blockDim.x) {
-        float w_val = W[idx2D(row, col, ldw)];
-        float a_val = A[idx2D(row, col, lda)];
         float v_val = v[row];
-        
-        w_sum += w_val * v_val;
-        a_sum += a_val * v_val;
+
+        if (col < j) {
+            float w_val = W[idx2D(row, col, ldw)];
+            float a_val = A[idx2D(row, col, lda)];
+            w_sum += w_val * v_val;
+            a_sum += a_val * v_val;
+        }
+
+        float syma_val = A22[idx2D(row, col, lda)];
+        symv_sum += syma_val * v_val;
     }
-        
-    // Reduction within block for dot product
-    block_reduce_sum(w_sum, sdata, tid, blockDim.x);
-    if (tid == 0) {
-        tmp_vec[col] = sdata[0];
+
+    if (col < j) {
+        // Reduction within block for w_sum
+        block_reduce_sum(w_sum, sdata, tid, blockDim.x);
+        if (tid == 0) {
+            tmp_vec[col] = sdata[0];
+        }
+
+        // Reduction within block for a_sum  
+        block_reduce_sum(a_sum, sdata, tid, blockDim.x);
+        if (tid == 0) {
+            tmp_vec[col + j] = sdata[0];
+        }
     }
-    
-    block_reduce_sum(a_sum, sdata, tid, blockDim.x);
+
+    block_reduce_sum(symv_sum, sdata, tid, blockDim.x);
     if (tid == 0) {
-        tmp_vec[col + j] = sdata[0];
+        w[col] = sdata[0];
     }
 }
 
-__global__ void fused_gemv_kernel(int m, int j,
-                                  const float* __restrict__ A, int lda,
-                                  const float* __restrict__ W, int ldw,
-                                  const float* __restrict__ tmp_vec,
-                                  float* __restrict__ w) {
+__global__ void update_w_col_kernel(int m, int j,
+                                    const float* __restrict__ A, int lda,
+                                    const float* __restrict__ W, int ldw,
+                                    const float* __restrict__ tmp_vec,
+                                    float* __restrict__ w) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     
     extern __shared__ float sdata[];
@@ -468,14 +487,13 @@ extern "C" hipError_t hip_latrd(
 
     for (int j = 0; j < panel_size; ++j) {
         int m = n - j - 1;
-
+        
+        // A[j:, j] -= A[j:, :j] * W[j, :j]^T + W[j:, :j] * A[j, :j]^T
         if (j > 0) {
-            // Compute the update to column j of A
-            // A[j:, j] -= A[j:, :j] * W[j, :j]^T + W[j:, :j] * A[j, :j]^T
             int len = n - j;
             int blocks_updates = CEIL_DIV(len, threads);
             size_t shmem_updates = 2 * j * sizeof(float);
-            hipLaunchKernelGGL(accumulate_column_updates, dim3(blocks_updates), dim3(threads), shmem_updates, 0,
+            hipLaunchKernelGGL(accumulate_a_col_updates, dim3(blocks_updates), dim3(threads), shmem_updates, 0,
                                len, j, dA, lda, dW, ldw);
         }
 
@@ -497,18 +515,23 @@ extern "C" hipError_t hip_latrd(
         // w = A[j+1:, j+1:] @ v
         //   - A[j+1:, :j] @ (W[j+1:, :j].T @ v)
         //   - W[j+1:, :j] @ (A[j+1:, :j].T @ v)
-        rocblas_ssymv(handle, uplo, m, d_scalars + 0,
-                      dA + idx2D(j + 1, j + 1, lda), lda, 
-                      v_vec, 1, d_scalars + 2, w_vec, 1);
-
         if (j > 0) {            
-            hipLaunchKernelGGL(fused_transpose_gemv_kernel, dim3(j), dim3(threads), shmem_bytes, 0,
-                               m, j, dA + j + 1, lda, dW + j + 1, ldw, v_vec, d_tmp_vec);
-
-            hipLaunchKernelGGL(fused_gemv_kernel, dim3(CEIL_DIV(m, 256)), dim3(256), 2*j*sizeof(float), 0,
+            hipLaunchKernelGGL(compute_w_col_kernel, dim3(m), dim3(threads), shmem_bytes, 0,
+                               m, j,
+                               dA + idx2D(j + 1, j + 1, lda), lda,
+                               dA + j + 1,
+                               dW + j + 1, ldw,
+                               v_vec, w_vec, d_tmp_vec);
+            
+            hipLaunchKernelGGL(update_w_col_kernel, dim3(CEIL_DIV(m, 256)), dim3(256), 2*j*sizeof(float), 0,
                                m, j, dA + j + 1, lda, dW + j + 1, ldw, d_tmp_vec, w_vec);
+        } else {
+            rocblas_sgemv(handle, rocblas_operation_none, m, m, d_scalars + 0,
+                          dA + idx2D(j + 1, j + 1, lda), lda, 
+                          v_vec, 1, d_scalars + 2, w_vec, 1);
         }
 
+        // w = tau * (w - 0.5 * tau * dot(w, v) * v)
         {
             float *tau_ptr = dTau + j;
             if (m <= 2048) {
@@ -579,13 +602,21 @@ extern "C" hipError_t hip_ssytrd(
 
         j += panel_size;
 
-        rocblas_ssyr2k(handle, uplo, rocblas_operation_none,
-                       n - j, panel_size,
-                       d_scalars + 1, // minus_one
-                       dA_panel + panel_size, lda,
-                       dW + panel_size, ldw,
-                       d_scalars + 0, // one
-                       dA + idx2D(j, j, lda), lda);
+        // A[j:, j:] -= W[j:, :j] * A[j, :j]^T + A[j:, :j] * W[j, :j]^T
+        rocblas_sgemm(handle, rocblas_operation_none, rocblas_operation_transpose,
+                      n - j, n - j, panel_size,
+                      d_scalars + 1, // -1.0f
+                      dA_panel + panel_size, lda,
+                      dW + panel_size, ldw,
+                      d_scalars + 0, // 1.0f
+                      dA + idx2D(j, j, lda), lda);
+        rocblas_sgemm(handle, rocblas_operation_none, rocblas_operation_transpose,
+                      n - j, n - j, panel_size,
+                      d_scalars + 1, // -1.0f
+                      dW + panel_size, ldw,
+                      dA_panel + panel_size, lda,
+                      d_scalars + 0, // 1.0f
+                      dA + idx2D(j, j, lda), lda);
     }
     if (j < n - 2) {
         hip_sytd2(handle,
