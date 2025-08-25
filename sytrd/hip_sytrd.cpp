@@ -53,67 +53,7 @@ __device__ __forceinline__ void block_reduce_sum(float val, float *smem, int tid
 
 // Kernel to compute Householder reflector (larfg) for a column vector
 __global__ void larfg_kernel(int m, int i, float* __restrict__ A, int lda,
-                             float* __restrict__ dE, float* __restrict__ dTau,
-                             float* __restrict__ partial_sums) {
-    cg::grid_group grid = cg::this_grid();
-    extern __shared__ float sdata[];
-
-    int tid  = threadIdx.x;
-    int bdim = blockDim.x;
-    int gid  = blockIdx.x * bdim + tid;
-
-    float* col_base = A + idx2D(i + 1, i, lda);
-
-    float val, local = 0.0f;
-
-    if (gid < m) {
-        val = col_base[gid];
-        local = gid > 0? val * val : 0.0f;
-    }
-    
-    block_reduce_sum(local, sdata, tid, bdim);
-    if (tid == 0) partial_sums[blockIdx.x] = sdata[0];
-
-    grid.sync();
-
-    if (blockIdx.x == 0) {
-        float ps = 0.0f;
-        for (int idx = tid; idx < gridDim.x; idx += bdim) ps += partial_sums[idx];
-        
-        block_reduce_sum(ps, sdata, tid, bdim);
-        if (tid == 0) partial_sums[0] = sdata[0];
-    }
-    float alpha = col_base[0];
-
-    grid.sync();
-
-    float sigma2 = partial_sums[0];
-    float beta, tau, scale;
-    if (sigma2 < 1e-10f) {
-        tau   = 0.0f;
-        beta  = alpha;
-        scale = 0.0f;
-    } else {
-        float sigma = sqrtf(sigma2);
-        float r = hypotf(alpha, sigma);
-        beta = -copysignf(r, alpha == 0.0f ? 1.0f : alpha);
-        tau  = (beta - alpha) / beta;
-        scale = 1.0f / (alpha - beta);
-    }
-
-    val = gid == 0 ? 1.0f : val * scale;
-    if (gid < m) {
-        col_base[gid] = val;
-        if (gid == 0) {
-            dE[i]   = beta;
-            dTau[i] = tau;
-        }
-    }
-}
-
-// Optimized single-block version for small vectors (m <= 2048)
-__global__ void larfg_kernel_small(int m, int i, float* __restrict__ A, int lda,
-                                   float* __restrict__ dE, float* __restrict__ dTau) {
+                             float* __restrict__ dE, float* __restrict__ dTau) {
     extern __shared__ float sdata[];
     int tid = threadIdx.x;
     float* col_base = A + idx2D(i + 1, i, lda);
@@ -121,9 +61,30 @@ __global__ void larfg_kernel_small(int m, int i, float* __restrict__ A, int lda,
     // Accumulate sum of squares of tail (excluding first element)
     float local_sum = 0.0f;
     float alpha = 0.0f;
-    for (int idx = tid; idx < m; idx += blockDim.x) {
+
+    int m_vec4 = m / 4;
+    
+    #pragma unroll 4
+    for (int idx4 = tid; idx4 < m_vec4; idx4 += blockDim.x) {
+        float4 val4 = reinterpret_cast<const float4*>(&col_base[idx4 * 4])[0];
+        
+        // Handle first element specially (alpha extraction)
+        if (idx4 == 0) {
+            alpha = val4.x;
+            local_sum += (val4.y * val4.y + val4.z * val4.z + val4.w * val4.w);
+        } else {
+            local_sum += (val4.x * val4.x + val4.y * val4.y + 
+                         val4.z * val4.z + val4.w * val4.w);
+        }
+    }
+    
+    for (int idx = 4 * m_vec4 + tid; idx < m; idx += blockDim.x) {
         float val = col_base[idx];
-        if (idx == 0) alpha = val; else local_sum += val * val;
+        if (idx == 0 && m_vec4 == 0) {
+            alpha = val;
+        } else if (idx > 0) {
+            local_sum += val * val;
+        }
     }
 
     // Reduction within block for local_sum
@@ -156,9 +117,32 @@ __global__ void larfg_kernel_small(int m, int i, float* __restrict__ A, int lda,
         dTau[i] = tau;
     }
 
-    // Scale tail and set first element = 1
-    for (int idx = tid; idx < m; idx += blockDim.x) {
-        if (idx == 0) col_base[0] = 1.0f; else col_base[idx] *= scale;
+    #pragma unroll 4
+    for (int idx4 = tid; idx4 < m_vec4; idx4 += blockDim.x) {
+        if (idx4 == 0) {
+            // Handle first element specially (set to 1.0f) and scale the rest
+            float4 val4 = reinterpret_cast<const float4*>(&col_base[idx4 * 4])[0];
+            val4.x = 1.0f;
+            val4.y *= scale;
+            val4.z *= scale;
+            val4.w *= scale;
+            reinterpret_cast<float4*>(&col_base[idx4 * 4])[0] = val4;
+        } else {
+            float4 val4 = reinterpret_cast<const float4*>(&col_base[idx4 * 4])[0];
+            val4.x *= scale;
+            val4.y *= scale;
+            val4.z *= scale;
+            val4.w *= scale;
+            reinterpret_cast<float4*>(&col_base[idx4 * 4])[0] = val4;
+        }
+    }
+    
+    for (int idx = 4 * m_vec4 + tid; idx < m; idx += blockDim.x) {
+        if (idx == 0 && m_vec4 == 0) {
+            col_base[0] = 1.0f;
+        } else if (idx > 0) {
+            col_base[idx] *= scale;
+        }
     }
 }
 
@@ -166,64 +150,29 @@ __global__ void larfg_kernel_small(int m, int i, float* __restrict__ A, int lda,
 __global__ void fused_dot_scale_axpy(int n,
                                      const float* __restrict__ v,
                                      float* __restrict__ w,
-                                     float* __restrict__ partial_sums,
                                      const float* __restrict__ tau_ptr) {
-    cg::grid_group grid = cg::this_grid();
-    extern __shared__ float sdata[];
-    int tid = threadIdx.x;
-    int gid = blockIdx.x * blockDim.x + tid;
-
-    float tau = *tau_ptr;
-
-    float w_val = 0.0f;
-    float v_val = 0.0f;
-    if (gid < n) {
-        w_val = w[gid];
-        v_val = v[gid];
-    }
-
-    float prod = w_val * v_val;
-    
-    block_reduce_sum(prod, sdata, tid, blockDim.x);
-    if (tid == 0) partial_sums[blockIdx.x] = sdata[0];
-
-    grid.sync();
-
-    if (blockIdx.x == 0) {
-        float sum = 0.0f;
-        for (int idx = tid; idx < gridDim.x; idx += blockDim.x) sum += partial_sums[idx];
-        
-        block_reduce_sum(sum, sdata, tid, blockDim.x);
-        if (tid == 0) partial_sums[0] = sdata[0];
-    }
-
-    grid.sync();
-
-    float dot = partial_sums[0];
-    float alpha_corr = -0.5f * tau * dot;
-
-    if (gid < n) {
-        w[gid] = tau * (w_val + alpha_corr * v_val);
-    }
-}
-
-// Optimized single-block version for small vectors (n <= 2048)
-__global__ void fused_dot_scale_axpy_small(int n,
-                                           const float* __restrict__ v,
-                                           float* __restrict__ w,
-                                           const float* __restrict__ tau_ptr) {
     extern __shared__ float sdata[];
     int tid = threadIdx.x;
     float tau = *tau_ptr;
 
     // Compute dot product within single block
     float local_dot = 0.0f;
-    float w_val = 0.0f;
-    float v_val = 0.0f;
     
-    for (int idx = tid; idx < n; idx += blockDim.x) {
-        w_val = w[idx];
-        v_val = v[idx];
+    int n_vec4 = n / 4;
+    
+    #pragma unroll 4
+    for (int idx4 = tid; idx4 < n_vec4; idx4 += blockDim.x) {
+        float4 w_val4 = reinterpret_cast<const float4*>(&w[idx4 * 4])[0];
+        float4 v_val4 = reinterpret_cast<const float4*>(&v[idx4 * 4])[0];
+        
+        local_dot += (w_val4.x * v_val4.x + w_val4.y * v_val4.y + 
+                     w_val4.z * v_val4.z + w_val4.w * v_val4.w);
+    }
+    
+    // Handle remaining elements for dot product
+    for (int idx = 4 * n_vec4 + tid; idx < n; idx += blockDim.x) {
+        float w_val = w[idx];
+        float v_val = v[idx];
         local_dot += w_val * v_val;
     }
 
@@ -235,10 +184,23 @@ __global__ void fused_dot_scale_axpy_small(int n,
     // Compute correction factor
     float alpha_corr = -0.5f * tau * dot;
 
-    // Apply fused scale and axpy operation
-    for (int idx = tid; idx < n; idx += blockDim.x) {
-        w_val = w[idx];
-        v_val = v[idx];
+    // Apply scale and axpy operation
+    #pragma unroll 4
+    for (int idx4 = tid; idx4 < n_vec4; idx4 += blockDim.x) {
+        float4 w_val4 = reinterpret_cast<const float4*>(&w[idx4 * 4])[0];
+        float4 v_val4 = reinterpret_cast<const float4*>(&v[idx4 * 4])[0];
+        
+        w_val4.x = tau * (w_val4.x + alpha_corr * v_val4.x);
+        w_val4.y = tau * (w_val4.y + alpha_corr * v_val4.y);
+        w_val4.z = tau * (w_val4.z + alpha_corr * v_val4.z);
+        w_val4.w = tau * (w_val4.w + alpha_corr * v_val4.w);
+        
+        reinterpret_cast<float4*>(&w[idx4 * 4])[0] = w_val4;
+    }
+    
+    for (int idx = 4 * n_vec4 + tid; idx < n; idx += blockDim.x) {
+        float w_val = w[idx];
+        float v_val = v[idx];
         w[idx] = tau * (w_val + alpha_corr * v_val);
     }
 }
@@ -305,7 +267,6 @@ extern "C" hipError_t hip_sytd2(
     float* dTau,
     int device_warp_size,
     float* w_vec,
-    float* d_partial_sums,
     const float* d_scalars)
 {
     const int threads = 256;
@@ -313,16 +274,9 @@ extern "C" hipError_t hip_sytd2(
 
     for (int j = 0; j < n - 2; ++j) {
         int m = n - j - 1;
-        int blocks = CEIL_DIV(m, threads);
 
-        if (m <= 2048) {
-            dim3 blk(threads); dim3 grd(1);
-            hipLaunchKernelGGL(larfg_kernel_small, grd, blk, shmem_bytes, 0,
-                               m, j, dA, lda, dE, dTau);
-        } else {
-            void* args[] = { &m, &j, &dA, &lda, &dE, &dTau, &d_partial_sums };
-            hipLaunchCooperativeKernel((void*)larfg_kernel, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
-        }
+        hipLaunchKernelGGL(larfg_kernel, dim3(1), dim3(threads), shmem_bytes, 0,
+                           m, j, dA, lda, dE, dTau);
 
         // w = A[j+1:, j+1:] @ v
         float* A22 = dA + idx2D(j + 1, j + 1, lda);
@@ -336,18 +290,8 @@ extern "C" hipError_t hip_sytd2(
         }
 
         // w = tau * (w - 0.5 * tau * dot(w, v) * v)
-        {
-            float *tau_ptr = dTau + j;
-            if (m <= 2048) {
-                // Single-block optimized path
-                dim3 blk(threads); dim3 grd(1);
-                hipLaunchKernelGGL(fused_dot_scale_axpy_small, grd, blk, shmem_bytes, 0,
-                                   m, v_vec, w_vec, tau_ptr);
-            } else {
-                void* args[] = { &m, &v_vec, &w_vec, &d_partial_sums, &tau_ptr };
-                hipLaunchCooperativeKernel((void*)fused_dot_scale_axpy, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
-            }
-        }
+        hipLaunchKernelGGL(fused_dot_scale_axpy, dim3(1), dim3(threads), shmem_bytes, 0,
+                           m, v_vec, w_vec, dTau + j);
 
         // A[j+1:, j+1:] -= v * w^T + w * v^T
         rocblas_ssyr2(handle, rocblas_fill_lower, m, d_scalars + 1, v_vec, 1, w_vec, 1, A22, lda);
@@ -400,8 +344,33 @@ __global__ void compute_w_col_kernel(int m, int j,
     float a_sum = 0.0f;
     float symv_sum = 0.0f;
 
-    for (int row = tid; row < m; row += blockDim.x) {
+    int m_vec4 = m / 4;
+        
+    #pragma unroll 4
+    for (int row4 = tid; row4 < m_vec4; row4 += blockDim.x) {
+        float4 v_val4 = reinterpret_cast<const float4*>(&v[row4 * 4])[0];
+        float4 syma_val4 = reinterpret_cast<const float4*>(&A22[idx2D(row4 * 4, col, lda)])[0];
+        
+        symv_sum += (syma_val4.x * v_val4.x + syma_val4.y * v_val4.y + 
+                    syma_val4.z * v_val4.z + syma_val4.w * v_val4.w);
+
+        if (col < j) {
+            float4 w_val4 = reinterpret_cast<const float4*>(&W[idx2D(row4 * 4, col, ldw)])[0];
+            float4 a_val4 = reinterpret_cast<const float4*>(&A[idx2D(row4 * 4, col, lda)])[0];
+
+            w_sum += (w_val4.x * v_val4.x + w_val4.y * v_val4.y + 
+                     w_val4.z * v_val4.z + w_val4.w * v_val4.w);
+            a_sum += (a_val4.x * v_val4.x + a_val4.y * v_val4.y + 
+                     a_val4.z * v_val4.z + a_val4.w * v_val4.w);
+        }
+    }
+
+    // Handle remaining elements
+    for (int row = 4 * m_vec4 + tid; row < m; row += blockDim.x) {
         float v_val = v[row];
+        
+        float syma_val = A22[idx2D(row, col, lda)];
+        symv_sum += syma_val * v_val;
 
         if (col < j) {
             float w_val = W[idx2D(row, col, ldw)];
@@ -409,9 +378,6 @@ __global__ void compute_w_col_kernel(int m, int j,
             w_sum += w_val * v_val;
             a_sum += a_val * v_val;
         }
-
-        float syma_val = A22[idx2D(row, col, lda)];
-        symv_sum += syma_val * v_val;
     }
 
     if (col < j) {
@@ -479,7 +445,6 @@ extern "C" hipError_t hip_latrd(
     int panel_size,
     int device_warp_size,
     float* d_tmp_vec,
-    float* d_partial_sums,
     const float* d_scalars)
 {
     const int threads = 256;
@@ -497,17 +462,9 @@ extern "C" hipError_t hip_latrd(
                                len, j, dA, lda, dW, ldw);
         }
 
-        int blocks = CEIL_DIV(m, threads);
-
-        if (m <= 2048) {
-            // Single-block optimized path
-            dim3 blk(threads); dim3 grd(1);
-            hipLaunchKernelGGL(larfg_kernel_small, grd, blk, shmem_bytes, 0,
-                               m, j, dA, lda, dE, dTau);
-        } else {
-            void* args[] = { &m, &j, &dA, &lda, &dE, &dTau, &d_partial_sums };
-            hipLaunchCooperativeKernel((void*)larfg_kernel, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
-        }
+        // Single-block optimized path
+        hipLaunchKernelGGL(larfg_kernel, dim3(1), dim3(threads), shmem_bytes, 0,
+                           m, j, dA, lda, dE, dTau);
 
         float* v_vec = dA + idx2D(j + 1, j, lda);
         float* w_vec = dW + idx2D(j + 1, j, ldw);
@@ -523,7 +480,7 @@ extern "C" hipError_t hip_latrd(
                                dW + j + 1, ldw,
                                v_vec, w_vec, d_tmp_vec);
             
-            hipLaunchKernelGGL(update_w_col_kernel, dim3(CEIL_DIV(m, 256)), dim3(256), 2*j*sizeof(float), 0,
+            hipLaunchKernelGGL(update_w_col_kernel, dim3(CEIL_DIV(m, threads)), dim3(threads), 2*j*sizeof(float), 0,
                                m, j, dA + j + 1, lda, dW + j + 1, ldw, d_tmp_vec, w_vec);
         } else {
             rocblas_sgemv(handle, rocblas_operation_none, m, m, d_scalars + 0,
@@ -532,18 +489,8 @@ extern "C" hipError_t hip_latrd(
         }
 
         // w = tau * (w - 0.5 * tau * dot(w, v) * v)
-        {
-            float *tau_ptr = dTau + j;
-            if (m <= 2048) {
-                // Single-block optimized path
-                dim3 blk(threads); dim3 grd(1);
-                hipLaunchKernelGGL(fused_dot_scale_axpy_small, grd, blk, shmem_bytes, 0,
-                                   m, v_vec, w_vec, tau_ptr);
-            } else {
-                void* args[] = { &m, &v_vec, &w_vec, &d_partial_sums, &tau_ptr };
-                hipLaunchCooperativeKernel((void*)fused_dot_scale_axpy, dim3(blocks), dim3(threads), args, shmem_bytes, 0);
-            }
-        }
+        hipLaunchKernelGGL(fused_dot_scale_axpy, dim3(1), dim3(threads), shmem_bytes, 0,
+                           m, v_vec, w_vec, dTau + j);
     }
     return hipSuccess;
 }
@@ -576,8 +523,6 @@ extern "C" hipError_t hip_ssytrd(
     hipMalloc(&dW, n * panel_size * sizeof(float));
     float* d_tmp_vec;
     hipMalloc(&d_tmp_vec, 2 * panel_size * sizeof(float));
-    float* d_partial_sums;
-    hipMalloc(&d_partial_sums, sizeof(float) * CEIL_DIV(n, threads));
 
     int j = 0;
     while(j < n - panel_size) {
@@ -597,7 +542,6 @@ extern "C" hipError_t hip_ssytrd(
                   panel_size,
                   device_warp_size,
                   d_tmp_vec,
-                  d_partial_sums,
                   d_scalars);
 
         j += panel_size;
@@ -629,7 +573,6 @@ extern "C" hipError_t hip_ssytrd(
                   dTau + j,
                   device_warp_size,
                   dW,
-                  d_partial_sums,
                   d_scalars);
     }
 
@@ -640,7 +583,6 @@ extern "C" hipError_t hip_ssytrd(
     hipDeviceSynchronize();
     hipFree(dW);
     hipFree(d_tmp_vec);
-    hipFree(d_partial_sums);
     hipFree(d_scalars);
 
     return hipSuccess;
