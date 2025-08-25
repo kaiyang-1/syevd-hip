@@ -219,40 +219,106 @@ __global__ void setup_tridiagonal(int n, float* A, int lda, float* D, float* E) 
     }
 }
 
-// Kernel to compute small-size symmetric-matrix-vector multiplication in single block
-__global__ void small_ssymv_kernel(int n,
-                                   float alpha,
-                                   const float* __restrict__ A, int lda,
-                                   const float* __restrict__ v,
-                                   float beta,
-                                   float* __restrict__ w) {
+// Fused kernel for tridiagolization of matrices of size <= warpSize
+__global__ void small_sytd2_kernel(int m, int j, float* __restrict__ A, int lda,
+                                   float* __restrict__ dE, float* __restrict__ dTau) {
+    extern __shared__ float sdata[];
     int tid = threadIdx.x;
-    int row = blockIdx.x * blockDim.x + tid;
     
-    extern __shared__ float sv[];
+    // Shared memory for Householder vector v and intermediate vector w
+    float* sv = sdata;
+    float* sw = sdata + m;
     
-    if (tid < n) {
-        sv[tid] = v[tid];
-    }
-    __syncthreads();
+    float* col_base = A + idx2D(j + 1, j, lda);
+    float* A22 = A + idx2D(j + 1, j + 1, lda);
     
-    if (row >= n) return;
+    // ==================== STEP 1: Compute Householder reflector ====================
+    float sigma2 = 0.0f;
+    float alpha = 0.0f;
     
-    float sum = 0.0f;
-    
-    #pragma unroll 8
-    for (int col = 0; col <= row; ++col) {
-        float a_val = A[idx2D(row, col, lda)];
-        sum += a_val * sv[col];
-    }
-    
-    #pragma unroll 8  
-    for (int col = row + 1; col < n; ++col) {
-        float a_val = A[idx2D(col, row, lda)];
-        sum += a_val * sv[col];
+    // Load column vector and compute sum of squares
+    for (int idx = tid; idx < m; idx += blockDim.x) {
+        float val = col_base[idx];
+        if (idx == 0) alpha = val; else sigma2 += val * val;
+        if (idx < m) sv[idx] = val;
     }
     
-    w[row] = (beta == 0.0f) ? alpha * sum : alpha * sum + beta * w[row];
+    // Reduction for sum of squares
+    sigma2 = warp_reduce_sum(sigma2);
+    sigma2 = __shfl(sigma2, 0);
+    alpha = __shfl(alpha, 0);
+    
+    // Compute Householder parameters
+    float beta, tau, scale;
+    if (sigma2 < 1e-10f) {
+        tau = 0.0f; beta = alpha; scale = 0.0f;
+    } else {
+        float sigma = sqrtf(sigma2);
+        float r = hypotf(alpha, sigma);
+        beta = -copysignf(r, alpha == 0.0f ? 1.0f : alpha);
+        tau = (beta - alpha) / beta;
+        scale = 1.0f / (alpha - beta);
+    }
+    
+    // Store tau & beta
+    if (tid == 0) {
+        dE[j] = beta;
+        dTau[j] = tau;
+    }
+    
+    // Update Householder vector in shared memory
+    for (int idx = tid; idx < m; idx += blockDim.x) {
+        if (idx == 0) sv[0] = 1.0f;
+        else sv[idx] *= scale;
+    }
+    
+    // ==================== STEP 2: Matrix-vector multiplication w = A22 * v ====================
+    // Each thread computes one element of w
+    if (tid < m) {
+        float sum = 0.0f;
+        for (int col = 0; col < m; col++) {
+            float a_val = A22[idx2D(tid, col, lda)];
+            sum += a_val * sv[col];
+        }
+        sw[tid] = sum;
+    }
+    
+    // ==================== STEP 3: Dot product and scaling w = tau * (w - 0.5 * tau * dot(w,v) * v) ====================
+    // Compute dot product w^T * v
+    float dot = 0.0f;
+    for (int idx = tid; idx < m; idx += blockDim.x) {
+        dot += sw[idx] * sv[idx];
+    }
+    dot = warp_reduce_sum(dot);
+    dot = __shfl(dot, 0);
+    
+    // Apply scaling: w = tau * (w - 0.5 * tau * dot * v)
+    float alpha_corr = -0.5f * tau * dot;
+    for (int idx = tid; idx < m; idx += blockDim.x) {
+        sw[idx] = tau * (sw[idx] + alpha_corr * sv[idx]);
+    }
+    
+    // ==================== STEP 4: Matrix update A22 -= v * w^T + w * v^T ====================
+    // Each thread processes one row of the matrix
+    if (tid < m) {
+        float v_row = sv[tid];
+        float w_row = sw[tid];
+        
+        for (int col = 0; col < m; col++) {
+            float a_val = A22[idx2D(tid, col, lda)];
+            float v_col = sv[col];
+            float w_col = sw[col];
+            
+            // A[row][col] -= v[row] * w[col] + w[row] * v[col]
+            A22[idx2D(tid, col, lda)] = a_val - (v_row * w_col + w_row * v_col);
+        }
+    }
+    
+    // ==================== STEP 5: Update original column vector ====================
+    // Write back the Householder vector to the lower trianglar part of A
+    for (int idx = tid; idx < m; idx += blockDim.x) {
+        col_base[idx] = sv[idx];
+    }
 }
 
 // Unblocked symmetric tridiagonal reduction
@@ -275,26 +341,29 @@ extern "C" hipError_t hip_sytd2(
     for (int j = 0; j < n - 2; ++j) {
         int m = n - j - 1;
 
-        hipLaunchKernelGGL(larfg_kernel, dim3(1), dim3(threads), shmem_bytes, 0,
-                           m, j, dA, lda, dE, dTau);
-
-        // w = A[j+1:, j+1:] @ v
-        float* A22 = dA + idx2D(j + 1, j + 1, lda);
-        float* v_vec = dA + idx2D(j + 1, j, lda);
-        if (m > 64) {
-            rocblas_ssymv(handle, rocblas_fill_lower, m, d_scalars + 0, A22, lda, v_vec, 1, d_scalars + 2, w_vec, 1);
+        if (m <= device_warp_size) {
+            // Use fused kernel for small matrices
+            size_t sytd2_shmem = 2 * m * sizeof(float);  // space for v, w vetors
+            hipLaunchKernelGGL(small_sytd2_kernel, dim3(1), dim3(device_warp_size), sytd2_shmem, 0,
+                               m, j, dA, lda, dE, dTau);
         } else {
-            int symv_blocks = CEIL_DIV(m, 64);
-            hipLaunchKernelGGL(small_ssymv_kernel, dim3(symv_blocks), dim3(64), m * sizeof(float), 0,
-                               m, 1.0f, A22, lda, v_vec, 0.0f, w_vec);
+            // Use separate kernels for larger matrices
+            hipLaunchKernelGGL(larfg_kernel, dim3(1), dim3(threads), shmem_bytes, 0,
+                               m, j, dA, lda, dE, dTau);
+
+            // w = A[j+1:, j+1:] @ v
+            float* A22 = dA + idx2D(j + 1, j + 1, lda);
+            float* v_vec = dA + idx2D(j + 1, j, lda);
+            rocblas_sgemv(handle, rocblas_operation_none, m, m, d_scalars + 0, A22, lda, v_vec, 1, d_scalars + 2, w_vec, 1);
+
+            // w = tau * (w - 0.5 * tau * dot(w, v) * v)
+            hipLaunchKernelGGL(fused_dot_scale_axpy, dim3(1), dim3(threads), shmem_bytes, 0,
+                               m, v_vec, w_vec, dTau + j);
+
+            // A[j+1:, j+1:] -= v * w^T + w * v^T
+            rocblas_sger(handle, m, m, d_scalars + 1, v_vec, 1, w_vec, 1, A22, lda);
+            rocblas_sger(handle, m, m, d_scalars + 1, w_vec, 1, v_vec, 1, A22, lda);
         }
-
-        // w = tau * (w - 0.5 * tau * dot(w, v) * v)
-        hipLaunchKernelGGL(fused_dot_scale_axpy, dim3(1), dim3(threads), shmem_bytes, 0,
-                           m, v_vec, w_vec, dTau + j);
-
-        // A[j+1:, j+1:] -= v * w^T + w * v^T
-        rocblas_ssyr2(handle, rocblas_fill_lower, m, d_scalars + 1, v_vec, 1, w_vec, 1, A22, lda);
     }
 
     return hipSuccess;
